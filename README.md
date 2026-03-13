@@ -29,15 +29,16 @@ This tool indexes everything into a single SQLite FTS5 database and exposes it t
 ## Quick start
 
 ```bash
-git clone https://github.com/yourusername/claude-session-search.git
+git clone https://github.com/renchris/claude-session-search.git
 cd claude-session-search
-./install.sh                          # Symlinks hooks + bin into ~/.claude/
-./scripts/session-index-backfill.sh   # Index all existing sessions (~940 in 30s)
-echo 'export PATH="$HOME/.claude/bin:$PATH"' >> ~/.zshrc
-source ~/.zshrc
+./install.sh
 ```
 
+One command handles everything: symlinks hooks and bin into `~/.claude/`, registers SessionEnd/SessionStart hooks in `settings.json`, backfills all existing sessions, tags them, and adds `~/.claude/bin` to your PATH.
+
 **Prerequisites**: `sqlite3` (macOS default, FTS5 required), `python3` 3.8+, `jq`. Optional: `fzf` (interactive mode), `rapidfuzz` (fuzzy correction).
+
+**Update**: `git pull && ./install.sh` | **Uninstall**: `./uninstall.sh`
 
 ## Search finds sessions by keyword, date, or abbreviation in <5ms
 

@@ -21,7 +21,16 @@ command -v python3 &>/dev/null || MISSING+=("python3")
 command -v jq &>/dev/null || MISSING+=("jq")
 
 if [ ${#MISSING[@]} -gt 0 ]; then
-    echo "Missing: ${MISSING[*]}. Install with: brew install ${MISSING[*]}" >&2
+    echo "Missing required: ${MISSING[*]}" >&2
+    if command -v brew &>/dev/null; then
+        echo "  brew install ${MISSING[*]}" >&2
+    elif command -v apt-get &>/dev/null; then
+        echo "  sudo apt-get install ${MISSING[*]}" >&2
+    elif command -v dnf &>/dev/null; then
+        echo "  sudo dnf install ${MISSING[*]}" >&2
+    else
+        echo "  Install via your system package manager." >&2
+    fi
     exit 1
 fi
 
@@ -126,5 +135,8 @@ echo "PATH: $PATH_MSG"
 echo ""
 echo "Try:  claude-search \"your query\""
 if ! command -v fzf &>/dev/null; then
-    echo "Tip:  brew install fzf   for interactive mode (--fzf)"
+    echo "Tip:  Install fzf for interactive mode (--fzf)"
+fi
+if ! python3 -c "import rapidfuzz" 2>/dev/null; then
+    echo "Tip:  pip install rapidfuzz   for fuzzy typo correction"
 fi

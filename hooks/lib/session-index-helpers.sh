@@ -1,0 +1,220 @@
+#!/bin/bash
+# Shared functions for session search indexing.
+# Source: . "$(dirname "$0")/lib/session-index-helpers.sh"
+# Or:    . "$REPO_DIR/hooks/lib/session-index-helpers.sh"
+
+SESSION_INDEX_DB="$HOME/.claude/session-index.db"
+SESSION_INDEX_LOG="$HOME/.claude/logs/session-index.log"
+CLAUDE_PROJECTS_DIR="$HOME/.claude/projects"
+CLAUDE_HISTORY="$HOME/.claude/history.jsonl"
+
+# ─── Logging ───────────────────────────────────────────────
+
+session_index_log() {
+    local msg="$1"
+    mkdir -p "$(dirname "$SESSION_INDEX_LOG")"
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $msg" >> "$SESSION_INDEX_LOG"
+}
+
+# ─── Database Init ─────────────────────────────────────────
+# Uses standalone FTS5 (no content= sync) to avoid SQLite trigger restrictions.
+# FTS is rebuilt after bulk operations and kept in sync manually on single upserts.
+
+session_index_init_db() {
+    mkdir -p "$(dirname "$SESSION_INDEX_DB")"
+    sqlite3 "$SESSION_INDEX_DB" >/dev/null <<'SCHEMA'
+PRAGMA journal_mode=WAL;
+PRAGMA synchronous=NORMAL;
+PRAGMA busy_timeout=1000;
+
+CREATE TABLE IF NOT EXISTS sessions (
+    session_id    TEXT PRIMARY KEY,
+    project_path  TEXT NOT NULL,
+    project_name  TEXT NOT NULL,
+    summary       TEXT NOT NULL DEFAULT '',
+    first_prompt  TEXT NOT NULL DEFAULT '',
+    git_branch    TEXT NOT NULL DEFAULT '',
+    created_at    TEXT NOT NULL,
+    modified_at   TEXT NOT NULL,
+    message_count INTEGER NOT NULL DEFAULT 0,
+    tags          TEXT NOT NULL DEFAULT '',
+    keywords      TEXT NOT NULL DEFAULT '',
+    source        TEXT NOT NULL DEFAULT 'unknown',
+    indexed_at    TEXT NOT NULL,
+    tagged_at     TEXT DEFAULT NULL
+);
+
+CREATE VIRTUAL TABLE IF NOT EXISTS sessions_fts USING fts5(
+    session_id, summary, first_prompt, tags, keywords, project_name,
+    tokenize='porter unicode61 remove_diacritics 1',
+    prefix='2 3'
+);
+
+CREATE TABLE IF NOT EXISTS synonyms (
+    term      TEXT NOT NULL,
+    expansion TEXT NOT NULL,
+    category  TEXT,
+    PRIMARY KEY (term, expansion)
+);
+
+CREATE TABLE IF NOT EXISTS search_log (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    query         TEXT,
+    result_count  INTEGER,
+    selected_id   TEXT,
+    selected_rank INTEGER,
+    pipeline_ms   INTEGER,
+    created_at    TEXT DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS meta (
+    key   TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
+SCHEMA
+}
+
+# ─── Upsert Session ───────────────────────────────────────
+
+session_index_upsert() {
+    local session_id="$1"
+    local project_path="$2"
+    local project_name="$3"
+    local summary="$4"
+    local first_prompt="$5"
+    local git_branch="$6"
+    local created_at="$7"
+    local modified_at="$8"
+    local message_count="$9"
+    local tags="${10}"
+    local keywords="${11}"
+    local source="${12}"
+    local now
+    now=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+
+    sqlite3 "$SESSION_INDEX_DB" <<SQL
+INSERT INTO sessions (session_id, project_path, project_name, summary, first_prompt,
+    git_branch, created_at, modified_at, message_count, tags, keywords, source, indexed_at)
+VALUES (
+    '$(echo "$session_id" | sed "s/'/''/g")',
+    '$(echo "$project_path" | sed "s/'/''/g")',
+    '$(echo "$project_name" | sed "s/'/''/g")',
+    '$(echo "$summary" | sed "s/'/''/g")',
+    '$(echo "$first_prompt" | sed "s/'/''/g")',
+    '$(echo "$git_branch" | sed "s/'/''/g")',
+    '$(echo "$created_at" | sed "s/'/''/g")',
+    '$(echo "$modified_at" | sed "s/'/''/g")',
+    $message_count,
+    '$(echo "$tags" | sed "s/'/''/g")',
+    '$(echo "$keywords" | sed "s/'/''/g")',
+    '$(echo "$source" | sed "s/'/''/g")',
+    '$now'
+)
+ON CONFLICT(session_id) DO UPDATE SET
+    project_path  = CASE WHEN excluded.source >= sessions.source THEN excluded.project_path  ELSE sessions.project_path  END,
+    project_name  = CASE WHEN excluded.source >= sessions.source THEN excluded.project_name  ELSE sessions.project_name  END,
+    summary       = CASE WHEN excluded.summary != '' AND (excluded.source >= sessions.source OR sessions.summary = '') THEN excluded.summary ELSE sessions.summary END,
+    first_prompt  = CASE WHEN excluded.first_prompt != '' AND (excluded.source >= sessions.source OR sessions.first_prompt = '') THEN excluded.first_prompt ELSE sessions.first_prompt END,
+    git_branch    = CASE WHEN excluded.git_branch != '' THEN excluded.git_branch ELSE sessions.git_branch END,
+    modified_at   = CASE WHEN excluded.modified_at > sessions.modified_at THEN excluded.modified_at ELSE sessions.modified_at END,
+    message_count = CASE WHEN excluded.message_count > sessions.message_count THEN excluded.message_count ELSE sessions.message_count END,
+    tags          = CASE WHEN excluded.tags != '' THEN excluded.tags ELSE sessions.tags END,
+    keywords      = CASE WHEN excluded.keywords != '' THEN excluded.keywords ELSE sessions.keywords END,
+    source        = CASE WHEN excluded.source >= sessions.source THEN excluded.source ELSE sessions.source END,
+    indexed_at    = '$now';
+SQL
+}
+
+# ─── Upsert + FTS sync (for single-row operations like hooks) ───
+
+session_index_upsert_with_fts() {
+    session_index_upsert "$@"
+    local session_id="$1"
+    local sid_escaped
+    sid_escaped=$(echo "$session_id" | sed "s/'/''/g")
+
+    # Remove old FTS entry, insert new one
+    sqlite3 "$SESSION_INDEX_DB" <<SQL
+DELETE FROM sessions_fts WHERE session_id = '$sid_escaped';
+INSERT INTO sessions_fts (session_id, summary, first_prompt, tags, keywords, project_name)
+    SELECT session_id, summary, first_prompt, tags, keywords, project_name
+    FROM sessions WHERE session_id = '$sid_escaped';
+SQL
+}
+
+# ─── Keyword Extraction ───────────────────────────────────
+
+session_index_extract_keywords() {
+    local text="$1"
+    # Extract: kebab-case, dotted names, file extensions, underscored names
+    # Note: grep -oE returns exit 1 on no match; || true prevents pipefail abort
+    echo "$text" | tr '[:upper:]' '[:lower:]' | \
+        (grep -oE '[a-z]+[-][a-z]+[-a-z]*|[a-z]+\.[a-z]+(\.[a-z]+)*|[a-z_]+\.(ts|tsx|js|jsx|py|sh|sql|json|md)|[a-z]+_[a-z_]+' || true) | \
+        sort -u | tr '\n' ' '
+}
+
+# ─── Project Name from Path ───────────────────────────────
+
+session_index_project_name() {
+    local project_path="$1"
+    basename "$project_path"
+}
+
+# ─── Lookup sessions-index.json ───────────────────────────
+
+session_index_lookup_sessions_index() {
+    local project_dir="$1"
+    local session_id="$2"
+    local index_file="$project_dir/sessions-index.json"
+
+    if [ ! -f "$index_file" ]; then
+        return 1
+    fi
+
+    jq -r --arg sid "$session_id" '
+        .entries[] | select(.sessionId == $sid) |
+        [.summary // "", .firstPrompt // "", .gitBranch // "",
+         .created // "", .modified // "", (.messageCount // 0 | tostring)] |
+        join("\t")
+    ' "$index_file" 2>/dev/null
+}
+
+# ─── Stats ─────────────────────────────────────────────────
+
+session_index_stats() {
+    if [ ! -f "$SESSION_INDEX_DB" ]; then
+        echo "No index database found."
+        return 1
+    fi
+    local total tagged projects last_indexed
+    total=$(sqlite3 "$SESSION_INDEX_DB" "SELECT COUNT(*) FROM sessions;" 2>/dev/null)
+    tagged=$(sqlite3 "$SESSION_INDEX_DB" "SELECT COUNT(*) FROM sessions WHERE tagged_at IS NOT NULL;" 2>/dev/null)
+    projects=$(sqlite3 "$SESSION_INDEX_DB" "SELECT COUNT(DISTINCT project_name) FROM sessions;" 2>/dev/null)
+    last_indexed=$(sqlite3 "$SESSION_INDEX_DB" "SELECT MAX(indexed_at) FROM sessions;" 2>/dev/null)
+    echo "Sessions: $total | Tagged: $tagged | Projects: $projects | Last indexed: $last_indexed"
+}
+
+# ─── Rebuild FTS (for bulk operations) ─────────────────────
+
+session_index_rebuild_fts() {
+    sqlite3 "$SESSION_INDEX_DB" <<'SQL'
+DELETE FROM sessions_fts;
+INSERT INTO sessions_fts (session_id, summary, first_prompt, tags, keywords, project_name)
+    SELECT session_id, summary, first_prompt, tags, keywords, project_name FROM sessions;
+SQL
+}
+
+# ─── Load Synonyms from JSON ──────────────────────────────
+
+session_index_load_synonyms() {
+    local synonyms_file="$1"
+    if [ ! -f "$synonyms_file" ]; then
+        session_index_log "Synonyms file not found: $synonyms_file"
+        return 1
+    fi
+
+    jq -r '.[] | .term as $term | .category as $cat | .expansions[] | [$term, ., $cat] | @tsv' "$synonyms_file" | \
+    while IFS=$'\t' read -r term expansion category; do
+        sqlite3 "$SESSION_INDEX_DB" "INSERT OR IGNORE INTO synonyms (term, expansion, category) VALUES ('$(echo "$term" | sed "s/'/''/g")', '$(echo "$expansion" | sed "s/'/''/g")', '$(echo "$category" | sed "s/'/''/g")');"
+    done
+}

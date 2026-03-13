@@ -1,0 +1,133 @@
+#!/bin/bash
+# Claude Session Search — Interactive CLI with fzf support.
+#
+# Usage:
+#   claude-search "bottle menu"                # Search, show ranked results
+#   claude-search --fzf "bottle"               # Interactive fzf mode
+#   claude-search --after 2026-03-01 "rum"     # Date filter
+#   claude-search --json "floor plan"          # JSON output
+#   claude-search --stats                      # Index statistics
+#   claude-search --preview <session_id>       # Preview session details
+set -euo pipefail
+
+SEARCH_PY="$HOME/.claude/bin/session-search.py"
+
+if [ ! -f "$SEARCH_PY" ]; then
+    echo "Error: session-search.py not found at $SEARCH_PY" >&2
+    echo "Run install.sh from the claude-session-search repo." >&2
+    exit 1
+fi
+
+# Parse arguments
+FZF_MODE=false
+ARGS=()
+QUERY_PARTS=()
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --fzf)
+            FZF_MODE=true
+            shift
+            ;;
+        --stats|--json)
+            ARGS+=("$1")
+            shift
+            ;;
+        --preview|--after|--before|--project|--limit|--format)
+            ARGS+=("$1" "$2")
+            shift 2
+            ;;
+        -*)
+            ARGS+=("$1")
+            shift
+            ;;
+        *)
+            QUERY_PARTS+=("$1")
+            shift
+            ;;
+    esac
+done
+
+QUERY="${QUERY_PARTS[*]:-}"
+
+# ─── Stats Mode ──────────────────────────────────────────
+
+if [[ " ${ARGS[*]} " =~ " --stats " ]]; then
+    python3 "$SEARCH_PY" --stats
+    exit 0
+fi
+
+# ─── Preview Mode ────────────────────────────────────────
+
+for i in "${!ARGS[@]}"; do
+    if [ "${ARGS[$i]}" = "--preview" ]; then
+        python3 "$SEARCH_PY" --preview "${ARGS[$((i+1))]}"
+        exit 0
+    fi
+done
+
+# ─── JSON Mode ───────────────────────────────────────────
+
+if [[ " ${ARGS[*]} " =~ " --json " ]]; then
+    python3 "$SEARCH_PY" --format=json "${ARGS[@]}" "$QUERY"
+    exit 0
+fi
+
+# ─── fzf Interactive Mode ────────────────────────────────
+
+if $FZF_MODE; then
+    if ! command -v fzf &>/dev/null; then
+        echo "Error: fzf not installed. Install with: brew install fzf" >&2
+        exit 1
+    fi
+
+    INITIAL_QUERY="$QUERY"
+
+    SELECTED=$(
+        python3 "$SEARCH_PY" --format=fzf ${ARGS[@]+"${ARGS[@]}"} "$INITIAL_QUERY" 2>/dev/null | \
+        fzf --ansi \
+            --delimiter='\t' \
+            --with-nth=1 \
+            --preview="python3 '$SEARCH_PY' --preview {-1}" \
+            --preview-window=right:50%:wrap \
+            --header="Enter: resume session | Ctrl-Y: copy ID | Ctrl-O: open transcript" \
+            --bind="ctrl-y:execute-silent(echo -n {-1} | pbcopy)+abort" \
+            --bind="ctrl-o:execute(open \$(python3 '$SEARCH_PY' --format=json --preview {-1} 2>/dev/null | jq -r '.project_path // empty'))" \
+            --bind="change:reload:python3 '$SEARCH_PY' --format=fzf ${ARGS[*]+${ARGS[*]}} {q} 2>/dev/null || true" \
+            --query="$INITIAL_QUERY" \
+            --color="pointer:#22c55e,prompt:#7c3aed,hl:#d4af37,hl+:#d4af37" \
+            --prompt="Search sessions > " \
+            --height=80% \
+            --layout=reverse \
+        || true
+    )
+
+    if [ -n "$SELECTED" ]; then
+        # Extract session_id (last tab-separated field)
+        SESSION_ID=$(echo "$SELECTED" | awk -F'\t' '{print $NF}' | tr -d '[:space:]')
+        if [ -n "$SESSION_ID" ]; then
+            echo "Resuming session: $SESSION_ID"
+            exec claude --resume "$SESSION_ID"
+        fi
+    fi
+    exit 0
+fi
+
+# ─── Standard Search Mode ────────────────────────────────
+
+if [ -z "$QUERY" ]; then
+    echo "Usage: claude-search [--fzf] [--after DATE] [--project NAME] \"query\""
+    echo ""
+    echo "Options:"
+    echo "  --fzf              Interactive fzf picker"
+    echo "  --after YYYY-MM-DD Filter by date"
+    echo "  --before YYYY-MM-DD Filter by date"
+    echo "  --project NAME     Filter by project"
+    echo "  --limit N          Max results (default 10)"
+    echo "  --json             JSON output"
+    echo "  --stats            Index statistics"
+    echo "  --preview ID       Preview a session"
+    exit 0
+fi
+
+python3 "$SEARCH_PY" "${ARGS[@]}" "$QUERY"

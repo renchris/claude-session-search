@@ -25,6 +25,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 DB_PATH = Path.home() / ".claude" / "session-index.db"
+CACHE_PATH = Path.home() / ".claude" / ".last-search-results.json"
 
 # ─── Temporal Extraction ──────────────────────────────────
 
@@ -551,21 +552,38 @@ def format_table(results):
         parts.append(f"{msg_str} {summary}")
         print(" ".join(parts))
 
-        # Line 2: tags (indented to align under summary)
+        # Line 2: tags + session ID
+        indent = 14  # base: #(3) + age(10) + gap(1)
+        if not single_project:
+            indent += 14
+        if show_branch:
+            indent += 16
+        indent += 5  # msgs col
+
+        sid = r["session_id"]
+        is_legacy = sid.startswith("legacy-")
+        sid_display = f"{DIM}*not resumable{RESET}" if is_legacy else f"{DIM}{sid}{RESET}"
+
         if tags:
-            indent = 14  # base: #(3) + age(10) + gap(1)
-            if not single_project:
-                indent += 14
-            if show_branch:
-                indent += 16
-            indent += 5  # msgs col
-            print(f"{' ' * indent}{DIM_CYAN}{tags}{RESET}")
+            # Tags left, session ID right
+            tag_len = len(tags)
+            sid_raw_len = len(sid) if not is_legacy else 14
+            available = term_width - indent - tag_len - 2
+            if available >= sid_raw_len:
+                gap = " " * max(2, available - sid_raw_len)
+                print(f"{' ' * indent}{DIM_CYAN}{tags}{RESET}{gap}{sid_display}")
+            else:
+                print(f"{' ' * indent}{DIM_CYAN}{tags}{RESET}")
+                print(f"{' ' * indent}{sid_display}")
+        else:
+            print(f"{' ' * indent}{sid_display}")
 
         # Blank line separator between results
         if i < len(results):
             print()
 
     print(f"\n{len(results)} result(s)")
+    print(f"{DIM}Resume: claude-search --resume N \"query\"  |  Interactive: claude-search --fzf \"query\"{RESET}")
 
 
 def format_fzf(results):
@@ -607,6 +625,31 @@ def format_preview(session):
         print(f"... ({len(prompt)} chars total)")
 
 
+# ─── Result Caching ──────────────────────────────────────
+
+def _cache_results(results):
+    """Cache search results for --resume without repeating query."""
+    try:
+        CACHE_PATH.write_text(json.dumps(
+            [{"session_id": r["session_id"], "summary": r.get("summary", ""),
+              "first_prompt": r.get("first_prompt", ""), "message_count": r.get("message_count", 0)}
+             for r in results],
+            default=str
+        ))
+    except Exception:
+        pass
+
+
+def _load_cached_results():
+    """Load cached results from last search."""
+    try:
+        if CACHE_PATH.exists():
+            return json.loads(CACHE_PATH.read_text())
+    except Exception:
+        pass
+    return []
+
+
 # ─── CLI ──────────────────────────────────────────────────
 
 def main():
@@ -618,6 +661,7 @@ def main():
     parser.add_argument("--after", help="Filter sessions after date (YYYY-MM-DD)")
     parser.add_argument("--before", help="Filter sessions before date (YYYY-MM-DD)")
     parser.add_argument("--min-msgs", type=int, default=0, help="Minimum message count filter")
+    parser.add_argument("--resume-result", type=int, metavar="N", help="Resume result #N (from last search or with query)")
     parser.add_argument("--preview", metavar="SESSION_ID", help="Preview a session")
     parser.add_argument("--context-inject", metavar="CWD", help="Generate SessionStart context")
     parser.add_argument("--stats", action="store_true", help="Show index statistics")
@@ -657,6 +701,36 @@ def main():
             return
 
         query = " ".join(args.query)
+
+        # --resume-result N: resume a result by number
+        if args.resume_result is not None:
+            n = args.resume_result
+            if query:
+                # Run search first, then resume result N
+                results = pipeline.search(
+                    query, limit=args.limit, project_filter=args.project,
+                    date_after=args.after, date_before=args.before,
+                    min_messages=args.min_msgs,
+                )
+                _cache_results(results)
+            else:
+                # Use cached results from last search
+                results = _load_cached_results()
+
+            if not results:
+                print("No results. Run a search first.", file=sys.stderr)
+                sys.exit(1)
+            if n < 1 or n > len(results):
+                print(f"Result #{n} out of range (1-{len(results)}).", file=sys.stderr)
+                sys.exit(1)
+            sid = results[n - 1]["session_id"]
+            if sid.startswith("legacy-"):
+                print(f"Result #{n} is a legacy session and cannot be resumed.", file=sys.stderr)
+                sys.exit(1)
+            # Output the session ID for the bash wrapper to exec
+            print(sid)
+            return
+
         if not query:
             parser.print_help()
             sys.exit(1)
@@ -674,6 +748,7 @@ def main():
         elapsed_ms = int((time.monotonic() - t0) * 1000)
 
         pipeline.log_search(query, len(results), pipeline_ms=elapsed_ms)
+        _cache_results(results)
 
         if args.format == "fzf":
             format_fzf(results)

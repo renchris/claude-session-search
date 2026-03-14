@@ -111,38 +111,6 @@ done
 
 log "Phase 1/3: sessions-index.json → $phase1_count sessions indexed"
 
-# ─── Phase 1b: Enrich with transcript context_text ────────
-
-log ""
-log "Phase 1b: Extracting context from transcripts..."
-phase1b_count=0
-
-for project_dir in "$CLAUDE_PROJECTS_DIR"/*/; do
-    for transcript in "$project_dir"*.jsonl; do
-        [ -f "$transcript" ] || continue
-        sid=$(basename "$transcript" .jsonl)
-        # Skip non-UUID filenames
-        [[ "$sid" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]] || continue
-
-        # Check if this session exists in DB and lacks context_text
-        existing_ctx=$(sqlite3 "$SESSION_INDEX_DB" "SELECT length(context_text) FROM sessions WHERE session_id='$sid';" 2>/dev/null || echo "")
-        if [ -n "$existing_ctx" ] && [ "$existing_ctx" != "0" ]; then
-            continue  # Already has context_text
-        fi
-
-        context_text=$(session_index_extract_context "$transcript" 5)
-        [ -z "$context_text" ] && continue
-
-        # Update context_text for existing session
-        ctx_escaped=$(echo "$context_text" | sed "s/'/''/g")
-        sqlite3 "$SESSION_INDEX_DB" "UPDATE sessions SET context_text='$ctx_escaped' WHERE session_id='$sid';" 2>/dev/null || true
-
-        phase1b_count=$((phase1b_count + 1))
-    done
-done
-
-log "Phase 1b: Transcript context → $phase1b_count sessions enriched"
-
 # ─── Phase 2: history.jsonl (gap fill) ────────────────────
 
 log ""
@@ -286,6 +254,67 @@ if [ -f "$CLAUDE_HISTORY" ]; then
 fi
 
 log "Phase 3/3: Legacy entries → $phase3_count synthetic sessions"
+
+# ─── Phase 4: Enrich from transcript files ────────────────
+# Runs AFTER all other phases so every session is in the DB.
+# Scans .jsonl transcripts: updates context_text + message_count for existing rows,
+# INSERTs new rows for transcript-only sessions.
+
+log ""
+log "Phase 4: Extracting context from transcripts..."
+phase4_enriched=0
+phase4_inserted=0
+
+for project_dir in "$CLAUDE_PROJECTS_DIR"/*/; do
+    dir_name=$(basename "$project_dir")
+    proj_path=$(echo "$dir_name" | sed 's/^-/\//' | sed 's/-/\//g')
+    proj_name=$(basename "$proj_path")
+
+    for transcript in "$project_dir"*.jsonl; do
+        [ -f "$transcript" ] || continue
+        sid=$(basename "$transcript" .jsonl)
+        [[ "$sid" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]] || continue
+
+        # Extract context and message count from transcript
+        context_text=$(session_index_extract_context "$transcript" 10)
+        msg_count=$(session_index_extract_transcript_meta "$transcript")
+        [ -z "$context_text" ] && [ "${msg_count:-0}" -lt 2 ] && continue
+
+        ctx_escaped=$(echo "$context_text" | sed "s/'/''/g")
+        sid_escaped=$(echo "$sid" | sed "s/'/''/g")
+
+        exists=$(sqlite3 "$SESSION_INDEX_DB" "SELECT 1 FROM sessions WHERE session_id='$sid_escaped' LIMIT 1;" 2>/dev/null || echo "")
+
+        if [ -n "$exists" ]; then
+            sqlite3 "$SESSION_INDEX_DB" <<SQL
+UPDATE sessions SET
+    context_text = '$ctx_escaped',
+    message_count = CASE WHEN $msg_count > message_count THEN $msg_count ELSE message_count END
+WHERE session_id = '$sid_escaped';
+SQL
+            phase4_enriched=$((phase4_enriched + 1))
+        else
+            now=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+            file_mtime=$(stat -f "%Sm" -t "%Y-%m-%dT%H:%M:%SZ" "$transcript" 2>/dev/null || echo "$now")
+            first_prompt=$(echo "$context_text" | head -c 500)
+            fp_escaped=$(echo "$first_prompt" | sed "s/'/''/g")
+            pp_escaped=$(echo "$proj_path" | sed "s/'/''/g")
+            pn_escaped=$(echo "$proj_name" | sed "s/'/''/g")
+            keywords=$(session_index_extract_keywords "$context_text" 2>/dev/null || echo "")
+            kw_escaped=$(echo "$keywords" | sed "s/'/''/g")
+
+            sqlite3 "$SESSION_INDEX_DB" <<SQL
+INSERT OR IGNORE INTO sessions (session_id, project_path, project_name, summary, first_prompt,
+    context_text, git_branch, created_at, modified_at, message_count, tags, keywords, source, indexed_at)
+VALUES ('$sid_escaped', '$pp_escaped', '$pn_escaped', '', '$fp_escaped',
+    '$ctx_escaped', '', '$file_mtime', '$file_mtime', $msg_count, '', '$kw_escaped', 'transcript', '$now');
+SQL
+            phase4_inserted=$((phase4_inserted + 1))
+        fi
+    done
+done
+
+log "Phase 4: Transcript context → $phase4_enriched enriched, $phase4_inserted new"
 
 # ─── Load Synonyms ────────────────────────────────────────
 

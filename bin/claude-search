@@ -4,6 +4,8 @@
 # Usage:
 #   claude-search "bottle menu"                # Search, show ranked results
 #   claude-search --fzf "bottle"               # Interactive fzf mode
+#   claude-search --resume 1 "bottle"          # Resume result #1 from search
+#   claude-search --resume 3                   # Resume result #3 from last search
 #   claude-search --after 2026-03-01 "rum"     # Date filter
 #   claude-search --json "floor plan"          # JSON output
 #   claude-search --stats                      # Index statistics
@@ -20,6 +22,7 @@ fi
 
 # Parse arguments
 FZF_MODE=false
+RESUME_N=""
 ARGS=()
 QUERY_PARTS=()
 
@@ -28,6 +31,10 @@ while [ $# -gt 0 ]; do
         --fzf)
             FZF_MODE=true
             shift
+            ;;
+        --resume)
+            RESUME_N="$2"
+            shift 2
             ;;
         --stats|--json)
             ARGS+=("$1")
@@ -50,9 +57,36 @@ done
 
 QUERY="${QUERY_PARTS[*]:-}"
 
+# ─── Resume Mode ───────────────────────────────────────────
+
+if [ -n "$RESUME_N" ]; then
+    # Build args for --resume-result
+    RESUME_ARGS=(--resume-result "$RESUME_N")
+    if [ ${#ARGS[@]} -gt 0 ]; then
+        RESUME_ARGS+=("${ARGS[@]}")
+    fi
+    if [ -n "$QUERY" ]; then
+        RESUME_ARGS+=("$QUERY")
+    fi
+
+    SESSION_ID=$(python3 "$SEARCH_PY" "${RESUME_ARGS[@]}" 2>&1)
+    EXIT_CODE=$?
+
+    if [ $EXIT_CODE -ne 0 ]; then
+        echo "$SESSION_ID" >&2
+        exit 1
+    fi
+
+    if [ -n "$SESSION_ID" ]; then
+        echo "Resuming session: $SESSION_ID"
+        exec claude --resume "$SESSION_ID"
+    fi
+    exit 0
+fi
+
 # ─── Stats Mode ──────────────────────────────────────────
 
-if [[ " ${ARGS[*]} " =~ " --stats " ]]; then
+if [[ " ${ARGS[*]:-} " =~ " --stats " ]]; then
     python3 "$SEARCH_PY" --stats
     exit 0
 fi
@@ -68,8 +102,8 @@ done
 
 # ─── JSON Mode ───────────────────────────────────────────
 
-if [[ " ${ARGS[*]} " =~ " --json " ]]; then
-    python3 "$SEARCH_PY" --format=json "${ARGS[@]}" "$QUERY"
+if [[ " ${ARGS[*]:-} " =~ " --json " ]]; then
+    python3 "$SEARCH_PY" --format=json ${ARGS[@]+"${ARGS[@]}"} "$QUERY"
     exit 0
 fi
 
@@ -116,10 +150,11 @@ fi
 # ─── Standard Search Mode ────────────────────────────────
 
 if [ -z "$QUERY" ]; then
-    echo "Usage: claude-search [--fzf] [--after DATE] [--project NAME] \"query\""
+    echo "Usage: claude-search [--fzf] [--resume N] [--after DATE] [--project NAME] \"query\""
     echo ""
     echo "Options:"
     echo "  --fzf              Interactive fzf picker"
+    echo "  --resume N         Resume result #N (with query or from last search)"
     echo "  --after YYYY-MM-DD Filter by date"
     echo "  --before YYYY-MM-DD Filter by date"
     echo "  --project NAME     Filter by project"
@@ -131,4 +166,4 @@ if [ -z "$QUERY" ]; then
     exit 0
 fi
 
-python3 "$SEARCH_PY" "${ARGS[@]}" "$QUERY"
+python3 "$SEARCH_PY" ${ARGS[@]+"${ARGS[@]}"} "$QUERY"

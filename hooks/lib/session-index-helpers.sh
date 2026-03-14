@@ -201,29 +201,67 @@ session_index_lookup_sessions_index() {
 
 session_index_extract_context() {
     local transcript_path="$1"
-    local max_messages="${2:-5}"
+    local max_messages="${2:-10}"
     [ -f "$transcript_path" ] || return
     python3 -c "
-import json, sys
+import json, sys, re
 msgs = []
+total_user = 0
 with open('$transcript_path') as f:
     for line in f:
         try:
             d = json.loads(line)
             if d.get('type') != 'user': continue
+            total_user += 1
             content = d.get('message', {}).get('content', '')
             if isinstance(content, list):
                 text = ' '.join(c.get('text','') for c in content if isinstance(c, dict) and c.get('type')=='text')
             else:
                 text = str(content)
             text = text.strip()
-            # Skip system/command messages
-            if text.startswith('<') or text.startswith('<!--') or not text: continue
-            msgs.append(text[:300])
+            # Skip system/command/XML messages and single-word responses
+            if not text or text.startswith('<') or text.startswith('<!--'): continue
+            if len(text) < 10: continue
+            # Skip plan preambles (## Context, ## Phase, markdown headers at start)
+            # but keep the substantive parts
+            lines = text.split('\n')
+            substantive = []
+            for ln in lines:
+                ln = ln.strip()
+                if not ln: continue
+                # Skip markdown structure: headers, horizontal rules, code fences
+                if re.match(r'^#{1,4}\s', ln) or ln.startswith('---') or ln.startswith('\`\`\`'): continue
+                # Skip bullet points that are just labels
+                if re.match(r'^[-*]\s\*\*\w+\*\*:', ln): continue
+                substantive.append(ln)
+            text = ' '.join(substantive)[:400]
+            if len(text) < 10: continue
+            msgs.append(text)
             if len(msgs) >= $max_messages: break
         except: pass
-print(' '.join(msgs)[:1500])
+# Output: context text, then message count on a separate line
+print(' '.join(msgs)[:2500])
+print(total_user, file=sys.stderr)
 " 2>/dev/null || echo ""
+}
+
+# Extract both context_text and message_count from a transcript
+session_index_extract_transcript_meta() {
+    local transcript_path="$1"
+    [ -f "$transcript_path" ] || return
+    python3 -c "
+import json, os
+path = '$transcript_path'
+user_count = 0
+with open(path) as f:
+    for line in f:
+        try:
+            d = json.loads(line)
+            if d.get('type') == 'user':
+                user_count += 1
+        except: pass
+print(user_count)
+" 2>/dev/null || echo "0"
 }
 
 # ─── Stats ─────────────────────────────────────────────────

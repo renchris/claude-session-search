@@ -537,7 +537,9 @@ def format_table(results, elapsed_ms=0):
     COL_NUM = 4
     COL_AGE = 10
     COL_MSGS = 6
-    summary_budget = cw - COL_NUM - COL_AGE - COL_MSGS
+    COL_ID = 10  # "  " + 8-char ID
+    summary_with_id = cw - COL_NUM - COL_AGE - COL_MSGS  # budget when ID is on line 1
+    summary_no_id = summary_with_id  # same budget, ID goes on line 2 with tags
     indent = COL_NUM + COL_AGE + COL_MSGS
 
     print()
@@ -551,29 +553,33 @@ def format_table(results, elapsed_ms=0):
         sid = r["session_id"]
         is_legacy = sid.startswith("legacy-")
         short_id = "*" if is_legacy else sid[:8]
-        summary = _smart_truncate(r["summary"] or r["first_prompt"] or "(no summary)", summary_budget)
-        tags_str = _truncate_tags(r.get("tags", ""), summary_budget - 12)
+        tags_str = _truncate_tags(r.get("tags", ""), summary_no_id - COL_ID - 2)
 
-        # Message count styling
+        # Message count: right-aligned in column
+        msgs_str = str(msgs)
         if msgs >= 50:
-            msg_styled = f"{BOLD_YELLOW}{msgs:<{COL_MSGS}}{R}"
+            msg_styled = f"{BOLD_YELLOW}{msgs_str:>{COL_MSGS - 1}}{R} "
         elif msgs >= 20:
-            msg_styled = f"{BOLD}{msgs:<{COL_MSGS}}{R}"
+            msg_styled = f"{BOLD}{msgs_str:>{COL_MSGS - 1}}{R} "
         elif msgs <= 2:
-            msg_styled = f"{DIM}{msgs:<{COL_MSGS}}{R}"
+            msg_styled = f"{DIM}{msgs_str:>{COL_MSGS - 1}}{R} "
         else:
-            msg_styled = f"{msgs:<{COL_MSGS}}"
+            msg_styled = f"{msgs_str:>{COL_MSGS - 1}} "
 
-        # Line 1: #  age  msgs  summary
-        print(f"  {DIM}{i:<{COL_NUM}}{R}{YELLOW}{age:<{COL_AGE}}{R}{msg_styled}{summary}")
-
-        # Line 2: tags (left) + short ID (right)
-        line2_width = cw - indent
         if tags_str:
+            # Has tags → summary on line 1, tags + ID on line 2
+            summary = _smart_truncate(r["summary"] or r["first_prompt"] or "(no summary)", summary_no_id)
+            print(f"  {DIM}{i:<{COL_NUM}}{R}{YELLOW}{age:<{COL_AGE}}{R}{msg_styled}{summary}")
+            line2_width = cw - indent
             gap = line2_width - len(tags_str) - len(short_id)
             print(f"  {' ' * indent}{CYAN}{tags_str}{R}{' ' * max(2, gap)}{GRAY}{short_id}{R}")
         else:
-            print(f"  {' ' * indent}{' ' * (line2_width - len(short_id))}{GRAY}{short_id}{R}")
+            # No tags → summary + ID on line 1 (no lonely line 2)
+            id_budget = 2 + len(short_id)
+            summary = _smart_truncate(r["summary"] or r["first_prompt"] or "(no summary)", summary_with_id - id_budget)
+            vis_summary_len = len(summary)
+            gap = summary_with_id - vis_summary_len - len(short_id)
+            print(f"  {DIM}{i:<{COL_NUM}}{R}{YELLOW}{age:<{COL_AGE}}{R}{msg_styled}{summary}{' ' * max(2, gap)}{GRAY}{short_id}{R}")
 
     # ─── Footer Card ──────────────────────────────────────
     print()

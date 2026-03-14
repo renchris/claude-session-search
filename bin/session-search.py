@@ -486,104 +486,62 @@ def format_table(results):
     DIM = "\033[2m" if color else ""
     BOLD = "\033[1m" if color else ""
     YELLOW = "\033[33m" if color else ""
-    MAGENTA = "\033[35m" if color else ""
     DIM_CYAN = "\033[2;36m" if color else ""
     BOLD_YELLOW = "\033[1;33m" if color else ""
     RESET = "\033[0m" if color else ""
 
-    # Adaptive layout: hide branch when <30% populated
-    branch_count = sum(1 for r in results if r.get("git_branch"))
-    show_branch = branch_count / len(results) >= 0.3 if results else False
-
-    # Detect if single project dominates (>80%)
-    projects = [r["project_name"] for r in results]
-    top_project = max(set(projects), key=projects.count) if projects else ""
-    single_project = projects.count(top_project) / len(results) >= 0.8 if results else False
-
-    # Terminal width
+    # Terminal width — never wrap
     try:
         term_width = os.get_terminal_size().columns
     except (AttributeError, ValueError, OSError):
-        term_width = 100
+        term_width = 80
 
-    # Calculate fixed column widths
-    # #(3) + age(10) + msgs(5) + gaps(3) = 21 base
-    fixed = 21
-    if not single_project:
-        fixed += 14  # project col
-    if show_branch:
-        fixed += 15  # branch col
-    summary_width = max(30, term_width - fixed - 2)
-
-    # Header
-    header_parts = [f"{DIM}{'#':<3} {'Age':<10}"]
-    if not single_project:
-        header_parts.append(f"{'Project':<13}")
-    if show_branch:
-        header_parts.append(f"{'Branch':<15}")
-    header_parts.append(f"{'Msgs':<5} Summary{RESET}")
-    print(" ".join(header_parts))
-    print(f"{DIM}{'─' * min(term_width, 100)}{RESET}")
+    # Fixed columns: #(4) + age(10) + msgs(6) = 20 chars
+    # Line 2 indent: 4 chars (under #)
+    LINE1_FIXED = 20
+    LINE2_INDENT = 4
 
     for i, r in enumerate(results, 1):
         age = format_relative_time(r["created_at"])
         msgs = r["message_count"]
-        summary = _smart_truncate(r["summary"] or r["first_prompt"] or "(no summary)", summary_width)
-        tags = _truncate_tags(r.get("tags", ""), summary_width)
+        sid = r["session_id"]
+        is_legacy = sid.startswith("legacy-")
+        short_id = "*" if is_legacy else sid[:8]
+
+        # Line 1: #  age  msgs  summary (truncated to fit)
+        summary_budget = term_width - LINE1_FIXED
+        summary = _smart_truncate(r["summary"] or r["first_prompt"] or "(no summary)", summary_budget)
 
         # Message count styling
         if msgs >= 50:
-            msg_str = f"{BOLD_YELLOW}{msgs:<5}{RESET}"
+            msg_str = f"{BOLD_YELLOW}{msgs:<6}{RESET}"
         elif msgs >= 20:
-            msg_str = f"{BOLD}{msgs:<5}{RESET}"
+            msg_str = f"{BOLD}{msgs:<6}{RESET}"
         elif msgs <= 2:
-            msg_str = f"{DIM}{msgs:<5}{RESET}"
+            msg_str = f"{DIM}{msgs:<6}{RESET}"
         else:
-            msg_str = f"{msgs:<5}"
+            msg_str = f"{msgs:<6}"
 
-        # Build line 1
-        parts = [f"{DIM}{i:<3}{RESET} {YELLOW}{age:<10}{RESET}"]
-        if not single_project:
-            proj = r["project_name"][:12]
-            parts.append(f"{MAGENTA}{proj:<13}{RESET}")
-        if show_branch:
-            branch = (r["git_branch"] or "")[:14]
-            parts.append(f"{branch:<15}")
-        parts.append(f"{msg_str} {summary}")
-        print(" ".join(parts))
+        print(f"{DIM}{i:<4}{RESET}{YELLOW}{age:<10}{RESET}{msg_str}{summary}")
 
-        # Line 2: tags + session ID
-        indent = 14  # base: #(3) + age(10) + gap(1)
-        if not single_project:
-            indent += 14
-        if show_branch:
-            indent += 16
-        indent += 5  # msgs col
-
-        sid = r["session_id"]
-        is_legacy = sid.startswith("legacy-")
-        sid_display = f"{DIM}*not resumable{RESET}" if is_legacy else f"{DIM}{sid}{RESET}"
-
-        if tags:
-            # Tags left, session ID right
-            tag_len = len(tags)
-            sid_raw_len = len(sid) if not is_legacy else 14
-            available = term_width - indent - tag_len - 2
-            if available >= sid_raw_len:
-                gap = " " * max(2, available - sid_raw_len)
-                print(f"{' ' * indent}{DIM_CYAN}{tags}{RESET}{gap}{sid_display}")
+        # Line 2: tags (left) + short session ID (right)
+        tags_str = _truncate_tags(r.get("tags", ""), term_width - LINE2_INDENT - 12)
+        line2_content = term_width - LINE2_INDENT
+        if tags_str:
+            gap = line2_content - len(tags_str) - len(short_id)
+            if gap >= 2:
+                print(f"{' ' * LINE2_INDENT}{DIM_CYAN}{tags_str}{RESET}{' ' * gap}{DIM}{short_id}{RESET}")
             else:
-                print(f"{' ' * indent}{DIM_CYAN}{tags}{RESET}")
-                print(f"{' ' * indent}{sid_display}")
+                print(f"{' ' * LINE2_INDENT}{DIM_CYAN}{tags_str}{RESET}  {DIM}{short_id}{RESET}")
         else:
-            print(f"{' ' * indent}{sid_display}")
+            padding = line2_content - len(short_id)
+            print(f"{' ' * LINE2_INDENT}{' ' * max(0, padding)}{DIM}{short_id}{RESET}")
 
-        # Blank line separator between results
+        # Blank line between results (not after last)
         if i < len(results):
             print()
 
-    print(f"\n{len(results)} result(s)")
-    print(f"{DIM}Resume: claude-search --resume N \"query\"  |  Interactive: claude-search --fzf \"query\"{RESET}")
+    print(f"\n{DIM}{len(results)} results  |  --resume N to open  |  --fzf for interactive{RESET}")
 
 
 def format_fzf(results):

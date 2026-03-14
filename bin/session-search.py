@@ -460,8 +460,12 @@ def _smart_truncate(text, max_len):
 
 def _truncate_tags(tags_str, max_len):
     """Truncate tags at complete tag boundaries with +N overflow."""
-    if not tags_str or len(tags_str) <= max_len:
-        return tags_str or ""
+    if not tags_str:
+        return ""
+    # Normalize: always use ", " separator
+    tags_str = ", ".join(t.strip() for t in tags_str.split(","))
+    if len(tags_str) <= max_len:
+        return tags_str
     tags = [t.strip() for t in tags_str.split(",")]
     result = []
     length = 0
@@ -477,71 +481,119 @@ def _truncate_tags(tags_str, max_len):
     return ", ".join(result)
 
 
-def format_table(results):
+def format_table(results, elapsed_ms=0):
     if not results:
         print("No results found.")
         return
 
     color = _use_color()
-    DIM = "\033[2m" if color else ""
+    R = "\033[0m" if color else ""
     BOLD = "\033[1m" if color else ""
+    DIM = "\033[2m" if color else ""
+    GREEN = "\033[32m" if color else ""
     YELLOW = "\033[33m" if color else ""
-    DIM_CYAN = "\033[2;36m" if color else ""
+    GRAY = "\033[90m" if color else ""
+    CYAN = "\033[36m" if color else ""
+    BLUE = "\033[38;5;33m" if color else ""
     BOLD_YELLOW = "\033[1;33m" if color else ""
-    RESET = "\033[0m" if color else ""
 
-    # Terminal width — never wrap
+    # Box drawing
+    TL, TR, BL, BR = ("╭", "╮", "╰", "╯") if color else ("+", "+", "+", "+")
+    H, V = ("─", "│") if color else ("-", "|")
+
+    # Terminal width
     try:
-        term_width = os.get_terminal_size().columns
+        tw = os.get_terminal_size().columns
     except (AttributeError, ValueError, OSError):
-        term_width = 80
+        tw = 80
+    tw = min(tw, 120)
+    cw = tw - 4  # content width inside box
 
-    # Fixed columns: #(4) + age(10) + msgs(6) = 20 chars
-    # Line 2 indent: 4 chars (under #)
-    LINE1_FIXED = 20
-    LINE2_INDENT = 4
+    def strip_ansi(text):
+        import re
+        return re.sub(r'\033\[[0-9;]*m', '', text)
 
+    def box_top():
+        return f"{DIM}{TL}{H * (cw + 2)}{TR}{R}"
+
+    def box_bottom():
+        return f"{DIM}{BL}{H * (cw + 2)}{BR}{R}"
+
+    def box_row(content):
+        visible = strip_ansi(content)
+        pad = cw - len(visible)
+        return f"{DIM}{V}{R} {content}{' ' * max(0, pad)} {DIM}{V}{R}"
+
+    # ─── Header Card ───────────────────────────────────────
+    print()
+    print(box_top())
+    title = f"{BOLD}Session Search{R}"
+    meta = f"{DIM}{len(results)} results · {elapsed_ms}ms{R}"
+    title_vis = "Session Search"
+    meta_vis = f"{len(results)} results · {elapsed_ms}ms"
+    spacing = cw - len(title_vis) - len(meta_vis)
+    print(box_row(f"{title}{' ' * max(2, spacing)}{meta}"))
+    print(box_bottom())
+
+    # ─── Column Header ─────────────────────────────────────
+    COL_NUM = 4
+    COL_AGE = 10
+    COL_MSGS = 6
+    summary_budget = cw - COL_NUM - COL_AGE - COL_MSGS
+
+    print()
+    header = f"  {DIM}{'#':<{COL_NUM}}{'Age':<{COL_AGE}}{'Msgs':<{COL_MSGS}}Summary{R}"
+    print(header)
+    print(f"  {DIM}{H * cw}{R}")
+
+    # ─── Results ───────────────────────────────────────────
     for i, r in enumerate(results, 1):
         age = format_relative_time(r["created_at"])
         msgs = r["message_count"]
         sid = r["session_id"]
         is_legacy = sid.startswith("legacy-")
         short_id = "*" if is_legacy else sid[:8]
-
-        # Line 1: #  age  msgs  summary (truncated to fit)
-        summary_budget = term_width - LINE1_FIXED
         summary = _smart_truncate(r["summary"] or r["first_prompt"] or "(no summary)", summary_budget)
+        tags_str = _truncate_tags(r.get("tags", ""), summary_budget - 12)
 
         # Message count styling
         if msgs >= 50:
-            msg_str = f"{BOLD_YELLOW}{msgs:<6}{RESET}"
+            msg_styled = f"{BOLD_YELLOW}{msgs:<{COL_MSGS}}{R}"
         elif msgs >= 20:
-            msg_str = f"{BOLD}{msgs:<6}{RESET}"
+            msg_styled = f"{BOLD}{msgs:<{COL_MSGS}}{R}"
         elif msgs <= 2:
-            msg_str = f"{DIM}{msgs:<6}{RESET}"
+            msg_styled = f"{DIM}{msgs:<{COL_MSGS}}{R}"
         else:
-            msg_str = f"{msgs:<6}"
+            msg_styled = f"{msgs:<{COL_MSGS}}"
 
-        print(f"{DIM}{i:<4}{RESET}{YELLOW}{age:<10}{RESET}{msg_str}{summary}")
+        # Line 1: #  age  msgs  summary
+        num_str = f"{DIM}{i:<{COL_NUM}}{R}"
+        age_str = f"{YELLOW}{age:<{COL_AGE}}{R}"
+        print(f"  {num_str}{age_str}{msg_styled}{summary}")
 
-        # Line 2: tags (left) + short session ID (right)
-        tags_str = _truncate_tags(r.get("tags", ""), term_width - LINE2_INDENT - 12)
-        line2_content = term_width - LINE2_INDENT
+        # Line 2: tags (left) + short ID (right), indented under summary
+        indent = COL_NUM + COL_AGE + COL_MSGS
+        line2_width = cw - indent
         if tags_str:
-            gap = line2_content - len(tags_str) - len(short_id)
+            gap = line2_width - len(tags_str) - len(short_id)
             if gap >= 2:
-                print(f"{' ' * LINE2_INDENT}{DIM_CYAN}{tags_str}{RESET}{' ' * gap}{DIM}{short_id}{RESET}")
+                print(f"  {' ' * indent}{CYAN}{tags_str}{R}{' ' * gap}{GRAY}{short_id}{R}")
             else:
-                print(f"{' ' * LINE2_INDENT}{DIM_CYAN}{tags_str}{RESET}  {DIM}{short_id}{RESET}")
+                print(f"  {' ' * indent}{CYAN}{tags_str}{R}  {GRAY}{short_id}{R}")
         else:
-            padding = line2_content - len(short_id)
-            print(f"{' ' * LINE2_INDENT}{' ' * max(0, padding)}{DIM}{short_id}{RESET}")
+            pad = line2_width - len(short_id)
+            print(f"  {' ' * indent}{' ' * max(0, pad)}{GRAY}{short_id}{R}")
 
-        # Blank line between results (not after last)
         if i < len(results):
             print()
 
-    print(f"\n{DIM}{len(results)} results  |  --resume N to open  |  --fzf for interactive{RESET}")
+    # ─── Footer Card ───────────────────────────────────────
+    print()
+    print(box_top())
+    footer = f"{GREEN}●{R}  {DIM}--resume N{R} to open  {DIM}·{R}  {DIM}--fzf{R} for interactive"
+    print(box_row(footer))
+    print(box_bottom())
+    print()
 
 
 def format_fzf(results):
@@ -713,8 +765,7 @@ def main():
         elif args.format == "json":
             format_json(results)
         else:
-            format_table(results)
-            print(f"({elapsed_ms}ms)")
+            format_table(results, elapsed_ms)
 
     finally:
         pipeline.close()

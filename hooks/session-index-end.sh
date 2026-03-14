@@ -68,8 +68,14 @@ NOW=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
 [ -z "$MODIFIED_AT" ] && MODIFIED_AT="$NOW"
 [ -z "$MSG_COUNT" ] || [ "$MSG_COUNT" = "null" ] && MSG_COUNT=0
 
+# Extract context text from transcript (first 5 user messages)
+CONTEXT_TEXT=""
+if [ -n "$TRANSCRIPT_PATH" ] && [ -f "$TRANSCRIPT_PATH" ]; then
+    CONTEXT_TEXT=$(session_index_extract_context "$TRANSCRIPT_PATH" 5)
+fi
+
 # Extract keywords
-KEYWORDS=$(session_index_extract_keywords "$SUMMARY $FIRST_PROMPT")
+KEYWORDS=$(session_index_extract_keywords "$SUMMARY $FIRST_PROMPT $CONTEXT_TEXT")
 
 # Upsert
 session_index_upsert_with_fts \
@@ -84,7 +90,8 @@ session_index_upsert_with_fts \
     "$MSG_COUNT" \
     "" \
     "$KEYWORDS" \
-    "sessions-index"
+    "sessions-index" \
+    "$CONTEXT_TEXT"
 
 session_index_log "Indexed session $SESSION_ID ($PROJECT_NAME, ${MSG_COUNT} msgs)"
 exit 0

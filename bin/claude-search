@@ -33,7 +33,7 @@ while [ $# -gt 0 ]; do
             ARGS+=("$1")
             shift
             ;;
-        --preview|--after|--before|--project|--limit|--format)
+        --preview|--after|--before|--project|--limit|--format|--min-msgs)
             ARGS+=("$1" "$2")
             shift 2
             ;;
@@ -124,6 +124,7 @@ if [ -z "$QUERY" ]; then
     echo "  --before YYYY-MM-DD Filter by date"
     echo "  --project NAME     Filter by project"
     echo "  --limit N          Max results (default 10)"
+    echo "  --min-msgs N       Minimum message count"
     echo "  --json             JSON output"
     echo "  --stats            Index statistics"
     echo "  --preview ID       Preview a session"

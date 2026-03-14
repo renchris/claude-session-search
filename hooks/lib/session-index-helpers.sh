@@ -22,6 +22,20 @@ session_index_log() {
 
 session_index_init_db() {
     mkdir -p "$(dirname "$SESSION_INDEX_DB")"
+
+    # Migrate: add context_text column if missing
+    if [ -f "$SESSION_INDEX_DB" ]; then
+        local has_col
+        has_col=$(sqlite3 "$SESSION_INDEX_DB" "PRAGMA table_info(sessions);" 2>/dev/null | grep -c 'context_text' || true)
+        if [ "$has_col" = "0" ]; then
+            sqlite3 "$SESSION_INDEX_DB" >/dev/null 2>&1 <<'MIGRATE'
+ALTER TABLE sessions ADD COLUMN context_text TEXT NOT NULL DEFAULT '';
+DROP TABLE IF EXISTS sessions_fts;
+MIGRATE
+            session_index_log "Migrated: added context_text column, FTS will be recreated"
+        fi
+    fi
+
     sqlite3 "$SESSION_INDEX_DB" >/dev/null <<'SCHEMA'
 PRAGMA journal_mode=WAL;
 PRAGMA synchronous=NORMAL;
@@ -33,6 +47,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     project_name  TEXT NOT NULL,
     summary       TEXT NOT NULL DEFAULT '',
     first_prompt  TEXT NOT NULL DEFAULT '',
+    context_text  TEXT NOT NULL DEFAULT '',
     git_branch    TEXT NOT NULL DEFAULT '',
     created_at    TEXT NOT NULL,
     modified_at   TEXT NOT NULL,
@@ -45,7 +60,7 @@ CREATE TABLE IF NOT EXISTS sessions (
 );
 
 CREATE VIRTUAL TABLE IF NOT EXISTS sessions_fts USING fts5(
-    session_id, summary, first_prompt, tags, keywords, project_name,
+    session_id, summary, first_prompt, tags, keywords, project_name, context_text,
     tokenize='porter unicode61 remove_diacritics 1',
     prefix='2 3'
 );
@@ -89,18 +104,20 @@ session_index_upsert() {
     local tags="${10}"
     local keywords="${11}"
     local source="${12}"
+    local context_text="${13:-}"
     local now
     now=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
 
     sqlite3 "$SESSION_INDEX_DB" <<SQL
 INSERT INTO sessions (session_id, project_path, project_name, summary, first_prompt,
-    git_branch, created_at, modified_at, message_count, tags, keywords, source, indexed_at)
+    context_text, git_branch, created_at, modified_at, message_count, tags, keywords, source, indexed_at)
 VALUES (
     '$(echo "$session_id" | sed "s/'/''/g")',
     '$(echo "$project_path" | sed "s/'/''/g")',
     '$(echo "$project_name" | sed "s/'/''/g")',
     '$(echo "$summary" | sed "s/'/''/g")',
     '$(echo "$first_prompt" | sed "s/'/''/g")',
+    '$(echo "$context_text" | sed "s/'/''/g")',
     '$(echo "$git_branch" | sed "s/'/''/g")',
     '$(echo "$created_at" | sed "s/'/''/g")',
     '$(echo "$modified_at" | sed "s/'/''/g")',
@@ -115,6 +132,7 @@ ON CONFLICT(session_id) DO UPDATE SET
     project_name  = CASE WHEN excluded.source >= sessions.source THEN excluded.project_name  ELSE sessions.project_name  END,
     summary       = CASE WHEN excluded.summary != '' AND (excluded.source >= sessions.source OR sessions.summary = '') THEN excluded.summary ELSE sessions.summary END,
     first_prompt  = CASE WHEN excluded.first_prompt != '' AND (excluded.source >= sessions.source OR sessions.first_prompt = '') THEN excluded.first_prompt ELSE sessions.first_prompt END,
+    context_text  = CASE WHEN excluded.context_text != '' AND (excluded.source >= sessions.source OR sessions.context_text = '') THEN excluded.context_text ELSE sessions.context_text END,
     git_branch    = CASE WHEN excluded.git_branch != '' THEN excluded.git_branch ELSE sessions.git_branch END,
     modified_at   = CASE WHEN excluded.modified_at > sessions.modified_at THEN excluded.modified_at ELSE sessions.modified_at END,
     message_count = CASE WHEN excluded.message_count > sessions.message_count THEN excluded.message_count ELSE sessions.message_count END,
@@ -136,8 +154,8 @@ session_index_upsert_with_fts() {
     # Remove old FTS entry, insert new one
     sqlite3 "$SESSION_INDEX_DB" <<SQL
 DELETE FROM sessions_fts WHERE session_id = '$sid_escaped';
-INSERT INTO sessions_fts (session_id, summary, first_prompt, tags, keywords, project_name)
-    SELECT session_id, summary, first_prompt, tags, keywords, project_name
+INSERT INTO sessions_fts (session_id, summary, first_prompt, tags, keywords, project_name, context_text)
+    SELECT session_id, summary, first_prompt, tags, keywords, project_name, context_text
     FROM sessions WHERE session_id = '$sid_escaped';
 SQL
 }
@@ -179,6 +197,35 @@ session_index_lookup_sessions_index() {
     ' "$index_file" 2>/dev/null
 }
 
+# ─── Extract Context Text from Transcript ─────────────────
+
+session_index_extract_context() {
+    local transcript_path="$1"
+    local max_messages="${2:-5}"
+    [ -f "$transcript_path" ] || return
+    python3 -c "
+import json, sys
+msgs = []
+with open('$transcript_path') as f:
+    for line in f:
+        try:
+            d = json.loads(line)
+            if d.get('type') != 'user': continue
+            content = d.get('message', {}).get('content', '')
+            if isinstance(content, list):
+                text = ' '.join(c.get('text','') for c in content if isinstance(c, dict) and c.get('type')=='text')
+            else:
+                text = str(content)
+            text = text.strip()
+            # Skip system/command messages
+            if text.startswith('<') or text.startswith('<!--') or not text: continue
+            msgs.append(text[:300])
+            if len(msgs) >= $max_messages: break
+        except: pass
+print(' '.join(msgs)[:1500])
+" 2>/dev/null || echo ""
+}
+
 # ─── Stats ─────────────────────────────────────────────────
 
 session_index_stats() {
@@ -199,8 +246,8 @@ session_index_stats() {
 session_index_rebuild_fts() {
     sqlite3 "$SESSION_INDEX_DB" <<'SQL'
 DELETE FROM sessions_fts;
-INSERT INTO sessions_fts (session_id, summary, first_prompt, tags, keywords, project_name)
-    SELECT session_id, summary, first_prompt, tags, keywords, project_name FROM sessions;
+INSERT INTO sessions_fts (session_id, summary, first_prompt, tags, keywords, project_name, context_text)
+    SELECT session_id, summary, first_prompt, tags, keywords, project_name, context_text FROM sessions;
 SQL
 }
 

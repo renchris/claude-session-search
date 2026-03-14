@@ -189,7 +189,7 @@ class QueryPipeline:
             self.conn.row_factory = sqlite3.Row
         return self.conn
 
-    def search(self, raw_query, limit=10, project_filter=None, date_after=None, date_before=None):
+    def search(self, raw_query, limit=10, project_filter=None, date_after=None, date_before=None, min_messages=0):
         conn = self._connect()
         synonyms = load_synonyms(conn)
         known_terms = set(synonyms.keys())
@@ -237,17 +237,19 @@ class QueryPipeline:
         corrected = fuzzy_correct(tokens, known_terms)
 
         # 6. Progressive search
-        results = self._progressive_search(corrected, limit, project_filter, auto_date_range)
+        results = self._progressive_search(corrected, limit, project_filter, auto_date_range, min_messages)
 
-        # 7. Apply recency boost and sort
+        # 7. Apply recency boost + depth multiplier and sort
         for r in results:
             r["recency"] = recency_score(r["created_at"])
-            r["final_score"] = r.get("bm25", 0) * r["recency"]
+            msgs = max(r["message_count"], 1)
+            r["depth"] = max(0.3, min(3.0, math.log2(msgs + 1) / math.log2(6)))
+            r["final_score"] = r.get("bm25", 0) * r["recency"] * r["depth"]
         results.sort(key=lambda r: r["final_score"], reverse=True)
 
         return results[:limit]
 
-    def _progressive_search(self, tokens, limit, project_filter, date_range):
+    def _progressive_search(self, tokens, limit, project_filter, date_range, min_messages=0):
         """Try increasingly broad queries until we get results."""
         strategies = [
             # 1. Phrase match (AND)
@@ -264,20 +266,20 @@ class QueryPipeline:
             fts_query = strategy(tokens)
             if not fts_query:
                 continue
-            results = self._execute_query(fts_query, limit * 2, project_filter, date_range)
+            results = self._execute_query(fts_query, limit * 2, project_filter, date_range, min_messages)
             if results:
                 return results
         return []
 
-    def _execute_query(self, fts_query, limit, project_filter, date_range):
+    def _execute_query(self, fts_query, limit, project_filter, date_range, min_messages=0):
         conn = self._connect()
         # Standalone FTS5 table — join on session_id column
-        # BM25 weights: session_id(0), summary(10), first_prompt(2), tags(8), keywords(3), project_name(1)
+        # BM25 weights: session_id(0), summary(10), first_prompt(2), tags(5), keywords(3), project_name(1), context_text(1.5)
         sql = """
             SELECT s.session_id, s.project_path, s.project_name, s.summary,
                    s.first_prompt, s.git_branch, s.created_at, s.modified_at,
                    s.message_count, s.tags, s.keywords, s.source,
-                   bm25(sessions_fts, 0.0, 10.0, 2.0, 8.0, 3.0, 1.0) AS bm25_score
+                   bm25(sessions_fts, 0.0, 10.0, 2.0, 5.0, 3.0, 1.0, 1.5) AS bm25_score
             FROM sessions_fts
             JOIN sessions s ON s.session_id = sessions_fts.session_id
             WHERE sessions_fts MATCH ?
@@ -293,6 +295,10 @@ class QueryPipeline:
             sql += " AND s.created_at >= ? AND s.created_at <= ?"
             params.append(start.strftime("%Y-%m-%dT%H:%M:%SZ"))
             params.append(end.strftime("%Y-%m-%dT%H:%M:%SZ"))
+
+        if min_messages and min_messages > 0:
+            sql += " AND s.message_count >= ?"
+            params.append(min_messages)
 
         sql += " ORDER BY bm25_score LIMIT ?"
         params.append(limit)
@@ -438,23 +444,126 @@ def format_relative_time(created_at):
         return "?"
 
 
+def _use_color():
+    """Check if ANSI colors should be used."""
+    return sys.stdout.isatty() and not os.environ.get("NO_COLOR") and os.environ.get("TERM") != "dumb"
+
+
+def _smart_truncate(text, max_len):
+    """Truncate at word boundary with ellipsis."""
+    if len(text) <= max_len:
+        return text
+    truncated = text[:max_len - 1].rsplit(" ", 1)[0]
+    return truncated + "\u2026"
+
+
+def _truncate_tags(tags_str, max_len):
+    """Truncate tags at complete tag boundaries with +N overflow."""
+    if not tags_str or len(tags_str) <= max_len:
+        return tags_str or ""
+    tags = [t.strip() for t in tags_str.split(",")]
+    result = []
+    length = 0
+    for tag in tags:
+        needed = len(tag) + (2 if result else 0)
+        if length + needed > max_len - 4:
+            remaining = len(tags) - len(result)
+            if remaining > 0:
+                result.append(f"+{remaining}")
+            break
+        result.append(tag)
+        length += needed
+    return ", ".join(result)
+
+
 def format_table(results):
     if not results:
         print("No results found.")
         return
 
+    color = _use_color()
+    DIM = "\033[2m" if color else ""
+    BOLD = "\033[1m" if color else ""
+    YELLOW = "\033[33m" if color else ""
+    MAGENTA = "\033[35m" if color else ""
+    DIM_CYAN = "\033[2;36m" if color else ""
+    BOLD_YELLOW = "\033[1;33m" if color else ""
+    RESET = "\033[0m" if color else ""
+
+    # Adaptive layout: hide branch when <30% populated
+    branch_count = sum(1 for r in results if r.get("git_branch"))
+    show_branch = branch_count / len(results) >= 0.3 if results else False
+
+    # Detect if single project dominates (>80%)
+    projects = [r["project_name"] for r in results]
+    top_project = max(set(projects), key=projects.count) if projects else ""
+    single_project = projects.count(top_project) / len(results) >= 0.8 if results else False
+
+    # Terminal width
+    try:
+        term_width = os.get_terminal_size().columns
+    except (AttributeError, ValueError, OSError):
+        term_width = 100
+
+    # Calculate fixed column widths
+    # #(3) + age(10) + msgs(5) + gaps(3) = 21 base
+    fixed = 21
+    if not single_project:
+        fixed += 14  # project col
+    if show_branch:
+        fixed += 15  # branch col
+    summary_width = max(30, term_width - fixed - 2)
+
     # Header
-    print(f"{'#':<3} {'Age':<10} {'Project':<25} {'Branch':<15} {'Msgs':<5} Summary")
-    print("─" * 100)
+    header_parts = [f"{DIM}{'#':<3} {'Age':<10}"]
+    if not single_project:
+        header_parts.append(f"{'Project':<13}")
+    if show_branch:
+        header_parts.append(f"{'Branch':<15}")
+    header_parts.append(f"{'Msgs':<5} Summary{RESET}")
+    print(" ".join(header_parts))
+    print(f"{DIM}{'─' * min(term_width, 100)}{RESET}")
 
     for i, r in enumerate(results, 1):
         age = format_relative_time(r["created_at"])
-        proj = r["project_name"][:24]
-        branch = (r["git_branch"] or "")[:14]
         msgs = r["message_count"]
-        summary = (r["summary"] or r["first_prompt"] or "(no summary)")[:60]
-        tags = f" [{r['tags'][:30]}]" if r.get("tags") else ""
-        print(f"{i:<3} {age:<10} {proj:<25} {branch:<15} {msgs:<5} {summary}{tags}")
+        summary = _smart_truncate(r["summary"] or r["first_prompt"] or "(no summary)", summary_width)
+        tags = _truncate_tags(r.get("tags", ""), summary_width)
+
+        # Message count styling
+        if msgs >= 50:
+            msg_str = f"{BOLD_YELLOW}{msgs:<5}{RESET}"
+        elif msgs >= 20:
+            msg_str = f"{BOLD}{msgs:<5}{RESET}"
+        elif msgs <= 2:
+            msg_str = f"{DIM}{msgs:<5}{RESET}"
+        else:
+            msg_str = f"{msgs:<5}"
+
+        # Build line 1
+        parts = [f"{DIM}{i:<3}{RESET} {YELLOW}{age:<10}{RESET}"]
+        if not single_project:
+            proj = r["project_name"][:12]
+            parts.append(f"{MAGENTA}{proj:<13}{RESET}")
+        if show_branch:
+            branch = (r["git_branch"] or "")[:14]
+            parts.append(f"{branch:<15}")
+        parts.append(f"{msg_str} {summary}")
+        print(" ".join(parts))
+
+        # Line 2: tags (indented to align under summary)
+        if tags:
+            indent = 14  # base: #(3) + age(10) + gap(1)
+            if not single_project:
+                indent += 14
+            if show_branch:
+                indent += 16
+            indent += 5  # msgs col
+            print(f"{' ' * indent}{DIM_CYAN}{tags}{RESET}")
+
+        # Blank line separator between results
+        if i < len(results):
+            print()
 
     print(f"\n{len(results)} result(s)")
 
@@ -508,6 +617,7 @@ def main():
     parser.add_argument("--project", help="Filter by project name")
     parser.add_argument("--after", help="Filter sessions after date (YYYY-MM-DD)")
     parser.add_argument("--before", help="Filter sessions before date (YYYY-MM-DD)")
+    parser.add_argument("--min-msgs", type=int, default=0, help="Minimum message count filter")
     parser.add_argument("--preview", metavar="SESSION_ID", help="Preview a session")
     parser.add_argument("--context-inject", metavar="CWD", help="Generate SessionStart context")
     parser.add_argument("--stats", action="store_true", help="Show index statistics")
@@ -559,6 +669,7 @@ def main():
             project_filter=args.project,
             date_after=args.after,
             date_before=args.before,
+            min_messages=args.min_msgs,
         )
         elapsed_ms = int((time.monotonic() - t0) * 1000)
 

@@ -50,7 +50,8 @@ for project_dir in "$CLAUDE_PROJECTS_DIR"/*/; do
             created: (.created // ""),
             modified: (.modified // ""),
             msg_count: ((.messageCount // 0) | tostring),
-            project_path: (.projectPath // "")
+            project_path: (.projectPath // ""),
+            full_path: (.fullPath // "")
         }' "$index_file" > "$TMPFILE" 2>/dev/null || true
 
     while IFS= read -r json_line; do
@@ -65,6 +66,7 @@ for project_dir in "$CLAUDE_PROJECTS_DIR"/*/; do
         modified=$(echo "$json_line" | jq -r '.modified')
         msg_count=$(echo "$json_line" | jq -r '.msg_count')
         project_path=$(echo "$json_line" | jq -r '.project_path')
+        full_path=$(echo "$json_line" | jq -r '.full_path')
 
         # Use projectPath from JSON; fallback
         if [ -z "$project_path" ] || [ "$project_path" = "null" ]; then
@@ -72,7 +74,20 @@ for project_dir in "$CLAUDE_PROJECTS_DIR"/*/; do
         fi
         project_name=$(basename "$project_path")
 
-        keywords=$(session_index_extract_keywords "$summary $first_prompt" 2>/dev/null || echo "")
+        # Extract context_text from transcript (first 5 user messages)
+        # Try fullPath first, then <project_dir>/<sid>.jsonl
+        context_text=""
+        transcript_file=""
+        if [ -n "$full_path" ] && [ "$full_path" != "null" ] && [ -f "$full_path" ]; then
+            transcript_file="$full_path"
+        elif [ -f "${project_dir}${sid}.jsonl" ]; then
+            transcript_file="${project_dir}${sid}.jsonl"
+        fi
+        if [ -n "$transcript_file" ]; then
+            context_text=$(session_index_extract_context "$transcript_file" 5)
+        fi
+
+        keywords=$(session_index_extract_keywords "$summary $first_prompt $context_text" 2>/dev/null || echo "")
         session_index_upsert \
             "$sid" \
             "$project_path" \
@@ -85,7 +100,8 @@ for project_dir in "$CLAUDE_PROJECTS_DIR"/*/; do
             "${msg_count:-0}" \
             "" \
             "$keywords" \
-            "sessions-index"
+            "sessions-index" \
+            "$context_text"
 
         phase1_count=$((phase1_count + 1))
     done < "$TMPFILE"
@@ -94,6 +110,38 @@ for project_dir in "$CLAUDE_PROJECTS_DIR"/*/; do
 done
 
 log "Phase 1/3: sessions-index.json → $phase1_count sessions indexed"
+
+# ─── Phase 1b: Enrich with transcript context_text ────────
+
+log ""
+log "Phase 1b: Extracting context from transcripts..."
+phase1b_count=0
+
+for project_dir in "$CLAUDE_PROJECTS_DIR"/*/; do
+    for transcript in "$project_dir"*.jsonl; do
+        [ -f "$transcript" ] || continue
+        sid=$(basename "$transcript" .jsonl)
+        # Skip non-UUID filenames
+        [[ "$sid" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]] || continue
+
+        # Check if this session exists in DB and lacks context_text
+        existing_ctx=$(sqlite3 "$SESSION_INDEX_DB" "SELECT length(context_text) FROM sessions WHERE session_id='$sid';" 2>/dev/null || echo "")
+        if [ -n "$existing_ctx" ] && [ "$existing_ctx" != "0" ]; then
+            continue  # Already has context_text
+        fi
+
+        context_text=$(session_index_extract_context "$transcript" 5)
+        [ -z "$context_text" ] && continue
+
+        # Update context_text for existing session
+        ctx_escaped=$(echo "$context_text" | sed "s/'/''/g")
+        sqlite3 "$SESSION_INDEX_DB" "UPDATE sessions SET context_text='$ctx_escaped' WHERE session_id='$sid';" 2>/dev/null || true
+
+        phase1b_count=$((phase1b_count + 1))
+    done
+done
+
+log "Phase 1b: Transcript context → $phase1b_count sessions enriched"
 
 # ─── Phase 2: history.jsonl (gap fill) ────────────────────
 

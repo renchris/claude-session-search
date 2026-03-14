@@ -446,8 +446,8 @@ def format_relative_time(created_at):
 
 
 def _use_color():
-    """Check if ANSI colors should be used."""
-    return sys.stdout.isatty() and not os.environ.get("NO_COLOR") and os.environ.get("TERM") != "dumb"
+    """Check if ANSI colors should be used. Always on unless explicitly disabled."""
+    return not os.environ.get("NO_COLOR") and os.environ.get("TERM") != "dumb"
 
 
 def _smart_truncate(text, max_len):
@@ -497,9 +497,7 @@ def format_table(results, elapsed_ms=0):
     BLUE = "\033[38;5;33m" if color else ""
     BOLD_YELLOW = "\033[1;33m" if color else ""
 
-    # Box drawing
-    TL, TR, BL, BR = ("╭", "╮", "╰", "╯") if color else ("+", "+", "+", "+")
-    H, V = ("─", "│") if color else ("-", "|")
+    TL, TR, BL, BR, H, V = "╭", "╮", "╰", "╯", "─", "│"
 
     # Terminal width
     try:
@@ -535,18 +533,18 @@ def format_table(results, elapsed_ms=0):
     print(box_row(f"{title}{' ' * max(2, spacing)}{meta}"))
     print(box_bottom())
 
-    # ─── Column Header ─────────────────────────────────────
+    # ─── Section Header ───────────────────────────────────
     COL_NUM = 4
     COL_AGE = 10
     COL_MSGS = 6
     summary_budget = cw - COL_NUM - COL_AGE - COL_MSGS
+    indent = COL_NUM + COL_AGE + COL_MSGS
 
     print()
-    header = f"  {DIM}{'#':<{COL_NUM}}{'Age':<{COL_AGE}}{'Msgs':<{COL_MSGS}}Summary{R}"
-    print(header)
+    print(f"  {BOLD}Results{R}  {DIM}{len(results)} sessions{R}")
     print(f"  {DIM}{H * cw}{R}")
 
-    # ─── Results ───────────────────────────────────────────
+    # ─── Result Rows (dense — no blank lines) ─────────────
     for i, r in enumerate(results, 1):
         age = format_relative_time(r["created_at"])
         msgs = r["message_count"]
@@ -567,31 +565,20 @@ def format_table(results, elapsed_ms=0):
             msg_styled = f"{msgs:<{COL_MSGS}}"
 
         # Line 1: #  age  msgs  summary
-        num_str = f"{DIM}{i:<{COL_NUM}}{R}"
-        age_str = f"{YELLOW}{age:<{COL_AGE}}{R}"
-        print(f"  {num_str}{age_str}{msg_styled}{summary}")
+        print(f"  {DIM}{i:<{COL_NUM}}{R}{YELLOW}{age:<{COL_AGE}}{R}{msg_styled}{summary}")
 
-        # Line 2: tags (left) + short ID (right), indented under summary
-        indent = COL_NUM + COL_AGE + COL_MSGS
+        # Line 2: tags (left) + short ID (right)
         line2_width = cw - indent
         if tags_str:
             gap = line2_width - len(tags_str) - len(short_id)
-            if gap >= 2:
-                print(f"  {' ' * indent}{CYAN}{tags_str}{R}{' ' * gap}{GRAY}{short_id}{R}")
-            else:
-                print(f"  {' ' * indent}{CYAN}{tags_str}{R}  {GRAY}{short_id}{R}")
+            print(f"  {' ' * indent}{CYAN}{tags_str}{R}{' ' * max(2, gap)}{GRAY}{short_id}{R}")
         else:
-            pad = line2_width - len(short_id)
-            print(f"  {' ' * indent}{' ' * max(0, pad)}{GRAY}{short_id}{R}")
+            print(f"  {' ' * indent}{' ' * (line2_width - len(short_id))}{GRAY}{short_id}{R}")
 
-        if i < len(results):
-            print()
-
-    # ─── Footer Card ───────────────────────────────────────
+    # ─── Footer Card ──────────────────────────────────────
     print()
     print(box_top())
-    footer = f"{GREEN}●{R}  {DIM}--resume N{R} to open  {DIM}·{R}  {DIM}--fzf{R} for interactive"
-    print(box_row(footer))
+    print(box_row(f"{GREEN}●{R}  {DIM}--resume N{R} to open  {DIM}·{R}  {DIM}--fzf{R} for interactive"))
     print(box_bottom())
     print()
 

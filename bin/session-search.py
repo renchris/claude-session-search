@@ -526,44 +526,37 @@ def format_table(results, elapsed_ms=0):
     DIM = "\033[2m" if color else ""
     GREEN = "\033[32m" if color else ""
     YELLOW = "\033[33m" if color else ""
-    GRAY = "\033[90m" if color else ""
     CYAN = "\033[36m" if color else ""
+    BLUE = "\033[38;5;33m" if color else ""
     DIM_MAGENTA = "\033[2;35m" if color else ""
 
     H = "─"
 
-    # Terminal width
+    # Terminal width (capped at 120 per deploy-status convention)
     try:
         tw = os.get_terminal_size().columns
     except (AttributeError, ValueError, OSError):
         tw = 80
     tw = min(tw, 120)
+    cw = tw - 4  # content width (2 indent + 2 margin)
 
-    # Column layout:
-    #   [2 lead] [3 idx] [2 gap] [3 age] [1 gap] [4 msgs] [2 gap] [summary] [2 gap] [8 id]
-    #   Fixed prefix: 2+3+2+3+1+4+2 = 17 chars
-    #   Fixed suffix: 2+8 = 10 chars
-    #   Summary on line 1: tw - 17 - 10
-    #   Continuation lines indent to summary col (17), full width to edge: tw - 17
-    PREFIX = 17
-    SUFFIX = 10
-    summary_line1 = tw - PREFIX - SUFFIX
-    summary_cont = tw - PREFIX
+    # Summary line gets full content width (no ID interference)
+    summary_width = cw
 
     # ─── Header ───────────────────────────────────────────
     title = f"{BOLD}Session Search{R}"
     meta = f"{DIM}{len(results)} results · {elapsed_ms}ms{R}"
-    title_vis = "Session Search"
-    meta_vis = f"{len(results)} results · {elapsed_ms}ms"
-    spacing = tw - len(title_vis) - len(meta_vis) - 2
+    spacing = cw - len("Session Search") - len(f"{len(results)} results · {elapsed_ms}ms")
     print()
-    print(f" {title}{' ' * max(2, spacing)}{meta}")
-    print(f" {DIM}{H * (tw - 2)}{R}")
+    print(f"  {title}{' ' * max(2, spacing)}{meta}")
+    print(f"  {DIM}{H * cw}{R}")
 
-    # ─── Result Rows ──────────────────────────────────────
-    # Line 1:  ##  age msgs  summary_start.....................  sess_id
-    # Line 2+:               summary_continuation (full width)
-    # Last:                  tags (dim)
+    # ─── Result Cards (fixed 4-line height) ───────────────
+    # Line 1: DIM metadata row — visual anchor + separator
+    #         [idx]  ·  [age] ago  ·  [msgs] msgs  ·  [session_id]
+    # Line 2: Summary (default white, full width, single line)
+    # Line 3: Tags (dim magenta) or blank
+    # Line 4: Dim thin separator
     for i, r in enumerate(results, 1):
         age = format_relative_time(r["created_at"], compact=True)
         msgs = r["message_count"]
@@ -571,37 +564,40 @@ def format_table(results, elapsed_ms=0):
         is_legacy = sid.startswith("legacy-")
         short_id = "*" if is_legacy else sid[:8]
         summary_raw = r["summary"] or r["first_prompt"] or "(no summary)"
-        tags_str = _truncate_tags(r.get("tags", ""), summary_cont)
+        tags_str = _truncate_tags(r.get("tags", ""), summary_width)
 
-        # Msgs: cyan for quantitative distinction, bold only for 100+
-        msgs_str = str(msgs)
-        if msgs >= 100:
-            msg_styled = f"{BOLD}{CYAN}{msgs_str:>4}{R}  "
+        # Format msgs with unit
+        if msgs >= 1000:
+            msgs_display = f"{msgs / 1000:.1f}k"
         else:
-            msg_styled = f"{DIM}{msgs_str:>4}{R}  "
+            msgs_display = str(msgs)
 
-        # Wrap summary: line 1 has reduced width (ID takes space), continuations full width
-        s1 = _smart_truncate(summary_raw, summary_line1)
-        remainder = summary_raw[len(s1.rstrip("\u2026")):].strip() if len(summary_raw) > summary_line1 else ""
-        cont_lines = []
-        if remainder:
-            cont_lines = _wrap_lines(remainder, summary_cont, max_lines=2)
+        # Msgs color: cyan for >=100, dim otherwise
+        if msgs >= 100:
+            msgs_styled = f"{BOLD}{CYAN}{msgs_display}{R}"
+        else:
+            msgs_styled = f"{msgs_display}"
 
-        # Line 1: idx  age  msgs  summary  session_id
-        pad = summary_line1 - len(s1)
-        print(f"  {i:>2}  {DIM}{age:>3}{R} {msg_styled}{s1}{' ' * max(2, pad)}{YELLOW}{short_id}{R}")
+        # Line 1: metadata row (all dim, ID in blue)
+        print(f"  {DIM}{i:>2}  ·  {age} ago  ·  {R}{msgs_styled}{DIM} msgs  ·  {R}{BLUE}{short_id}{R}")
 
-        # Continuation lines (full width, no ID)
-        for cl in cont_lines:
-            print(f"{' ' * PREFIX}{cl}")
+        # Line 2: summary (primary content, full width, single line)
+        summary = _smart_truncate(summary_raw, summary_width)
+        print(f"  {summary}")
 
-        # Tags line (dim magenta)
+        # Line 3: tags or blank
         if tags_str:
-            print(f"{' ' * PREFIX}{DIM_MAGENTA}{tags_str}{R}")
+            print(f"  {DIM_MAGENTA}{tags_str}{R}")
+        else:
+            print()
+
+        # Line 4: separator (skip after last result)
+        if i < len(results):
+            print(f"  {DIM}{H * cw}{R}")
 
     # ─── Footer ───────────────────────────────────────────
-    print(f" {DIM}{H * (tw - 2)}{R}")
-    print(f" {GREEN}●{R}  {DIM}--resume N to open  ·  --fzf for interactive{R}")
+    print(f"  {DIM}{H * cw}{R}")
+    print(f"  {GREEN}●{R}  {DIM}--resume N to open  ·  --fzf for interactive{R}")
     print()
 
 

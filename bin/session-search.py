@@ -758,6 +758,62 @@ def format_json(results):
     print(json.dumps(results, indent=2, default=str))
 
 
+def _extract_last_messages(session_id, project_path, count=3):
+    """Extract last N user messages from transcript JSONL file."""
+    projects_dir = Path.home() / ".claude" / "projects"
+    # Encode project path: /Users/foo/bar → -Users-foo-bar
+    if project_path and project_path != "unknown":
+        encoded = project_path.replace("/", "-")
+        if not encoded.startswith("-"):
+            encoded = "-" + encoded
+        transcript = projects_dir / encoded / f"{session_id}.jsonl"
+    else:
+        transcript = None
+
+    # Try encoded path, then scan all project dirs
+    paths_to_try = []
+    if transcript and transcript.exists():
+        paths_to_try.append(transcript)
+    else:
+        for d in projects_dir.iterdir():
+            candidate = d / f"{session_id}.jsonl"
+            if candidate.exists():
+                paths_to_try.append(candidate)
+                break
+
+    if not paths_to_try:
+        return []
+
+    msgs = []
+    try:
+        with open(paths_to_try[0]) as f:
+            for line in f:
+                try:
+                    d = json.loads(line)
+                    if d.get("type") != "user":
+                        continue
+                    content = d.get("message", {}).get("content", "")
+                    if isinstance(content, list):
+                        text = " ".join(
+                            c.get("text", "") for c in content
+                            if isinstance(c, dict) and c.get("type") == "text"
+                        )
+                    else:
+                        text = str(content)
+                    text = text.strip()
+                    if not text or len(text) < 8:
+                        continue
+                    if text.startswith("<") or text.startswith("<!--"):
+                        continue
+                    msgs.append(text[:300])
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+    return msgs[-count:] if msgs else []
+
+
 def format_preview(session):
     if not session:
         print("Session not found.")
@@ -769,16 +825,28 @@ def format_preview(session):
     print(f"\033[1mMessages\033[0m: {session['message_count']}  |  Source: {session['source']}")
     if session.get("tags"):
         print(f"\033[1mTags\033[0m:    {session['tags']}")
+
+    # ─── Description (smart fallback) ─────────────────────
     print()
-    print(f"\033[1;33mSummary\033[0m:")
-    print(session.get("summary") or "(none)")
-    print()
-    print(f"\033[1;35mFirst Prompt\033[0m:")
-    prompt = session.get("first_prompt", "")
-    # Show first 500 chars
-    print(prompt[:500])
-    if len(prompt) > 500:
-        print(f"... ({len(prompt)} chars total)")
+    desc = _build_description(session)
+    print(f"\033[1;33mDescription\033[0m:")
+    print(desc[:600])
+
+    # ─── Last Messages (from transcript) ──────────────────
+    last_msgs = _extract_last_messages(
+        session["session_id"], session.get("project_path", "")
+    )
+    if last_msgs:
+        print()
+        print(f"\033[1;35mRecent Activity\033[0m ({len(last_msgs)} last messages):")
+        for msg in last_msgs:
+            # Clean and truncate
+            clean = " ".join(msg.split())[:200]
+            print(f"  \033[2m›\033[0m {clean}")
+    elif session.get("first_prompt"):
+        print()
+        print(f"\033[1;35mFirst Prompt\033[0m:")
+        print(session["first_prompt"][:300])
 
 
 # ─── Result Caching ──────────────────────────────────────

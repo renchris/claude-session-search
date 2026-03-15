@@ -275,12 +275,15 @@ class QueryPipeline:
     def _execute_query(self, fts_query, limit, project_filter, date_range, min_messages=0):
         conn = self._connect()
         # Standalone FTS5 table — join on session_id column
-        # BM25 weights: session_id(0), summary(10), first_prompt(2), tags(5), keywords(3), project_name(1), context_text(1.5)
+        # BM25 weights: session_id(0), summary(10), first_prompt(1.5), tags(5), keywords(3), project_name(0.5), context_text(2)
+        # first_prompt reduced 2→1.5 (often garbage like "commit this")
+        # context_text boosted 1.5→2 (rich keywords when summary absent)
+        # project_name reduced 1→0.5 (broad match, rarely decisive)
         sql = """
             SELECT s.session_id, s.project_path, s.project_name, s.summary,
                    s.first_prompt, s.context_text, s.git_branch, s.created_at,
                    s.modified_at, s.message_count, s.tags, s.keywords, s.source,
-                   bm25(sessions_fts, 0.0, 10.0, 2.0, 5.0, 3.0, 1.0, 1.5) AS bm25_score
+                   bm25(sessions_fts, 0.0, 10.0, 1.5, 5.0, 3.0, 0.5, 2.0) AS bm25_score
             FROM sessions_fts
             JOIN sessions s ON s.session_id = sessions_fts.session_id
             WHERE sessions_fts MATCH ?

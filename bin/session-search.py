@@ -570,17 +570,20 @@ def format_table(results, elapsed_ms=0):
     # Color hierarchy: summary = default (primary), everything else = dim
     # Layout per result:
     #   Line 1: #  age  msgs  [summary line 1]
-    #   Line 2:               [summary line 2]        short-id
+    #   Line 2:               [summary line 2]        short-id  (right-aligned to edge)
     #   Line 3 (if tags):     tags
+    line_width = cw - indent  # chars available for summary/tags/id after indent
+    id_len = 8  # short ID length
+    s2_budget = line_width - id_len - 2  # line 2 text budget (reserve gap + ID)
+
     for i, r in enumerate(results, 1):
         age = format_relative_time(r["created_at"])
         msgs = r["message_count"]
         sid = r["session_id"]
         is_legacy = sid.startswith("legacy-")
-        short_id = "*" if is_legacy else sid[:8]
+        short_id = "*" if is_legacy else sid[:id_len]
         summary_raw = r["summary"] or r["first_prompt"] or "(no summary)"
-        summary_budget = cw - indent
-        tags_str = _truncate_tags(r.get("tags", ""), summary_budget - COL_ID)
+        tags_str = _truncate_tags(r.get("tags", ""), line_width)
 
         # Msgs: dim for most, bold only for 100+
         msgs_str = str(msgs)
@@ -589,19 +592,21 @@ def format_table(results, elapsed_ms=0):
         else:
             msg_styled = f"{DIM}{msgs_str:>{COL_MSGS - 1}}{R} "
 
-        # Wrap summary to 2 lines
-        s1, s2 = _wrap_two_lines(summary_raw, summary_budget)
+        # Wrap summary: line 1 gets full width, line 2 reserves space for ID
+        s1, s2 = _wrap_two_lines(summary_raw, line_width)
+        if s2 and len(s2) > s2_budget:
+            s2 = _smart_truncate(s2, s2_budget)
 
         # Line 1: #  age  msgs  summary-start
         print(f"  {i:<{COL_NUM}}{DIM}{age:<{COL_AGE}}{R}{msg_styled}{s1}")
 
-        # Line 2: summary continuation (or empty) + short ID right-aligned
+        # Line 2: summary continuation + short ID (always right-aligned to edge)
         if s2:
-            gap = summary_budget - len(s2) - len(short_id)
-            print(f"  {' ' * indent}{s2}{' ' * max(2, gap)}{GRAY}{short_id}{R}")
+            pad = line_width - len(s2) - len(short_id)
+            print(f"  {' ' * indent}{s2}{' ' * max(2, pad)}{GRAY}{short_id}{R}")
         else:
-            gap = summary_budget - len(short_id)
-            print(f"  {' ' * indent}{' ' * max(0, gap)}{GRAY}{short_id}{R}")
+            pad = line_width - len(short_id)
+            print(f"  {' ' * indent}{' ' * pad}{GRAY}{short_id}{R}")
 
         # Line 3: tags (only if present)
         if tags_str:

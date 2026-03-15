@@ -36,6 +36,21 @@ MIGRATE
         fi
     fi
 
+    # Migrate: add enrichment columns if missing
+    if [ -f "$SESSION_INDEX_DB" ]; then
+        local has_assistant
+        has_assistant=$(sqlite3 "$SESSION_INDEX_DB" "PRAGMA table_info(sessions);" 2>/dev/null | grep -c 'assistant_text' || true)
+        if [ "$has_assistant" = "0" ]; then
+            sqlite3 "$SESSION_INDEX_DB" >/dev/null 2>&1 <<'MIGRATE2'
+ALTER TABLE sessions ADD COLUMN assistant_text TEXT NOT NULL DEFAULT '';
+ALTER TABLE sessions ADD COLUMN files_changed TEXT NOT NULL DEFAULT '';
+ALTER TABLE sessions ADD COLUMN commands_run TEXT NOT NULL DEFAULT '';
+DROP TABLE IF EXISTS sessions_fts;
+MIGRATE2
+            session_index_log "Migrated: added assistant_text, files_changed, commands_run columns, FTS will be recreated"
+        fi
+    fi
+
     sqlite3 "$SESSION_INDEX_DB" >/dev/null <<'SCHEMA'
 PRAGMA journal_mode=WAL;
 PRAGMA synchronous=NORMAL;
@@ -48,6 +63,9 @@ CREATE TABLE IF NOT EXISTS sessions (
     summary       TEXT NOT NULL DEFAULT '',
     first_prompt  TEXT NOT NULL DEFAULT '',
     context_text  TEXT NOT NULL DEFAULT '',
+    assistant_text TEXT NOT NULL DEFAULT '',
+    files_changed  TEXT NOT NULL DEFAULT '',
+    commands_run   TEXT NOT NULL DEFAULT '',
     git_branch    TEXT NOT NULL DEFAULT '',
     created_at    TEXT NOT NULL,
     modified_at   TEXT NOT NULL,
@@ -61,6 +79,7 @@ CREATE TABLE IF NOT EXISTS sessions (
 
 CREATE VIRTUAL TABLE IF NOT EXISTS sessions_fts USING fts5(
     session_id, summary, first_prompt, tags, keywords, project_name, context_text,
+    assistant_text, files_changed, commands_run,
     tokenize='porter unicode61 remove_diacritics 1',
     prefix='2 3'
 );
@@ -105,12 +124,16 @@ session_index_upsert() {
     local keywords="${11}"
     local source="${12}"
     local context_text="${13:-}"
+    local assistant_text="${14:-}"
+    local files_changed="${15:-}"
+    local commands_run="${16:-}"
     local now
     now=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
 
     sqlite3 "$SESSION_INDEX_DB" <<SQL
 INSERT INTO sessions (session_id, project_path, project_name, summary, first_prompt,
-    context_text, git_branch, created_at, modified_at, message_count, tags, keywords, source, indexed_at)
+    context_text, assistant_text, files_changed, commands_run,
+    git_branch, created_at, modified_at, message_count, tags, keywords, source, indexed_at)
 VALUES (
     '$(echo "$session_id" | sed "s/'/''/g")',
     '$(echo "$project_path" | sed "s/'/''/g")',
@@ -118,6 +141,9 @@ VALUES (
     '$(echo "$summary" | sed "s/'/''/g")',
     '$(echo "$first_prompt" | sed "s/'/''/g")',
     '$(echo "$context_text" | sed "s/'/''/g")',
+    '$(echo "$assistant_text" | sed "s/'/''/g")',
+    '$(echo "$files_changed" | sed "s/'/''/g")',
+    '$(echo "$commands_run" | sed "s/'/''/g")',
     '$(echo "$git_branch" | sed "s/'/''/g")',
     '$(echo "$created_at" | sed "s/'/''/g")',
     '$(echo "$modified_at" | sed "s/'/''/g")',
@@ -133,6 +159,9 @@ ON CONFLICT(session_id) DO UPDATE SET
     summary       = CASE WHEN excluded.summary != '' AND (excluded.source >= sessions.source OR sessions.summary = '') THEN excluded.summary ELSE sessions.summary END,
     first_prompt  = CASE WHEN excluded.first_prompt != '' AND (excluded.source >= sessions.source OR sessions.first_prompt = '') THEN excluded.first_prompt ELSE sessions.first_prompt END,
     context_text  = CASE WHEN excluded.context_text != '' AND (excluded.source >= sessions.source OR sessions.context_text = '') THEN excluded.context_text ELSE sessions.context_text END,
+    assistant_text = CASE WHEN excluded.assistant_text != '' AND (excluded.source >= sessions.source OR sessions.assistant_text = '') THEN excluded.assistant_text ELSE sessions.assistant_text END,
+    files_changed  = CASE WHEN excluded.files_changed != '' AND (excluded.source >= sessions.source OR sessions.files_changed = '') THEN excluded.files_changed ELSE sessions.files_changed END,
+    commands_run   = CASE WHEN excluded.commands_run != '' AND (excluded.source >= sessions.source OR sessions.commands_run = '') THEN excluded.commands_run ELSE sessions.commands_run END,
     git_branch    = CASE WHEN excluded.git_branch != '' THEN excluded.git_branch ELSE sessions.git_branch END,
     modified_at   = CASE WHEN excluded.modified_at > sessions.modified_at THEN excluded.modified_at ELSE sessions.modified_at END,
     message_count = CASE WHEN excluded.message_count > sessions.message_count THEN excluded.message_count ELSE sessions.message_count END,
@@ -154,8 +183,8 @@ session_index_upsert_with_fts() {
     # Remove old FTS entry, insert new one
     sqlite3 "$SESSION_INDEX_DB" <<SQL
 DELETE FROM sessions_fts WHERE session_id = '$sid_escaped';
-INSERT INTO sessions_fts (session_id, summary, first_prompt, tags, keywords, project_name, context_text)
-    SELECT session_id, summary, first_prompt, tags, keywords, project_name, context_text
+INSERT INTO sessions_fts (session_id, summary, first_prompt, tags, keywords, project_name, context_text, assistant_text, files_changed, commands_run)
+    SELECT session_id, summary, first_prompt, tags, keywords, project_name, context_text, assistant_text, files_changed, commands_run
     FROM sessions WHERE session_id = '$sid_escaped';
 SQL
 }
@@ -264,6 +293,58 @@ print(user_count)
 " 2>/dev/null || echo "0"
 }
 
+# ─── Extract Enriched Data from Transcript ─────────────────
+# Extracts assistant text, file paths, and commands from transcript JSONL.
+# Output: tab-separated assistant_text\tfiles_changed\tcommands_run
+
+session_index_extract_enriched() {
+    local transcript_path="$1"
+    local max_assistant_chars="${2:-3000}"
+    local max_files="${3:-100}"
+    [ -f "$transcript_path" ] || { printf '\t\t'; return; }
+    python3 -c "
+import json, sys
+assistant_texts = []
+files = set()
+commands = []
+with open('$transcript_path') as f:
+    for line in f:
+        try:
+            obj = json.loads(line)
+            if obj.get('type') == 'assistant':
+                for block in obj.get('message', {}).get('content', []):
+                    if block.get('type') == 'text':
+                        text = block.get('text', '').strip()
+                        if len(text) > 30 and not text.startswith('<'):
+                            assistant_texts.append(text[:500])
+                    elif block.get('type') == 'tool_use':
+                        name = block.get('name', '')
+                        inp = block.get('input', {})
+                        if name in ('Read', 'Write', 'Edit'):
+                            fp = inp.get('file_path', '')
+                            if fp:
+                                files.add(fp)
+                        elif name in ('Glob', 'Grep'):
+                            path = inp.get('path', '')
+                            pattern = inp.get('pattern', '')
+                            if path: files.add(path)
+                            if pattern: files.add(pattern)
+                        elif name == 'Bash':
+                            cmd = inp.get('command', '')
+                            if cmd and len(cmd) < 500:
+                                commands.append(cmd)
+            elif obj.get('type') == 'file-history-snapshot':
+                backups = obj.get('snapshot', {}).get('trackedFileBackups', {})
+                files.update(backups.keys())
+        except:
+            pass
+at = ' '.join(assistant_texts)[:$max_assistant_chars].replace('\t', ' ').replace('\n', ' ').replace('\r', ' ')
+fc = ' '.join(sorted(files)[:$max_files]).replace('\t', ' ').replace('\n', ' ')
+cr = ' '.join(commands[:50]).replace('\t', ' ').replace('\n', ' ').replace('\r', ' ')
+sys.stdout.write(at + '\t' + fc + '\t' + cr)
+" 2>/dev/null || printf '\t\t'
+}
+
 # ─── Stats ─────────────────────────────────────────────────
 
 session_index_stats() {
@@ -284,8 +365,8 @@ session_index_stats() {
 session_index_rebuild_fts() {
     sqlite3 "$SESSION_INDEX_DB" <<'SQL'
 DELETE FROM sessions_fts;
-INSERT INTO sessions_fts (session_id, summary, first_prompt, tags, keywords, project_name, context_text)
-    SELECT session_id, summary, first_prompt, tags, keywords, project_name, context_text FROM sessions;
+INSERT INTO sessions_fts (session_id, summary, first_prompt, tags, keywords, project_name, context_text, assistant_text, files_changed, commands_run)
+    SELECT session_id, summary, first_prompt, tags, keywords, project_name, context_text, assistant_text, files_changed, commands_run FROM sessions;
 SQL
 }
 

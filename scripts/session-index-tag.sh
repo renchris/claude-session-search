@@ -129,11 +129,13 @@ haiku_tag() {
     [ -z "$text" ] && return 1
 
     # Parse JSON from response
-    local tags
+    local tags haiku_summary
     tags=$(echo "$text" | jq -r '.tags // [] | join(",")' 2>/dev/null)
     [ -z "$tags" ] && return 1
+    haiku_summary=$(echo "$text" | jq -r '.summary // ""' 2>/dev/null)
 
-    echo "$tags"
+    # Output tags and summary tab-separated
+    printf '%s\t%s' "$tags" "$haiku_summary"
 }
 
 # ─── Process Sessions ─────────────────────────────────────
@@ -156,11 +158,13 @@ while IFS=$'\t' read -r sid summary first_prompt project_name; do
     fi
 
     tags=""
+    haiku_summary=""
 
     # Try Haiku first (if API key available and not regex-only)
     if ! $REGEX_ONLY && [ -n "${ANTHROPIC_API_KEY:-}" ]; then
-        tags=$(haiku_tag "$summary" "$first_prompt" "$project_name" 2>/dev/null || echo "")
-        if [ -n "$tags" ]; then
+        haiku_result=$(haiku_tag "$summary" "$first_prompt" "$project_name" 2>/dev/null || echo "")
+        if [ -n "$haiku_result" ]; then
+            IFS=$'\t' read -r tags haiku_summary <<< "$haiku_result"
             # Rate limit: 100ms between API calls
             sleep 0.1
         fi
@@ -173,7 +177,11 @@ while IFS=$'\t' read -r sid summary first_prompt project_name; do
 
     if [ -n "$tags" ]; then
         NOW=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
-        sqlite3 "$SESSION_INDEX_DB" "UPDATE sessions SET tags='$(echo "$tags" | sed "s/'/''/g")', tagged_at='$NOW' WHERE session_id='$(echo "$sid" | sed "s/'/''/g")';"
+        tags_escaped=$(echo "$tags" | sed "s/'/''/g")
+        summary_escaped=$(echo "$haiku_summary" | sed "s/'/''/g")
+        sid_escaped=$(echo "$sid" | sed "s/'/''/g")
+        # Persist tags always; persist summary only if existing is empty and Haiku provided one
+        sqlite3 "$SESSION_INDEX_DB" "UPDATE sessions SET tags='$tags_escaped', summary=CASE WHEN '$summary_escaped' != '' AND summary = '' THEN '$summary_escaped' ELSE summary END, tagged_at='$NOW' WHERE session_id='$sid_escaped';"
         TAGGED=$((TAGGED + 1))
         echo "[$TAGGED] $sid → $tags"
     else

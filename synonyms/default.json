@@ -43,5 +43,20 @@
   {"term": "task", "expansions": ["todo", "task list", "task tracking", "progress"], "category": "workflow"},
   {"term": "memory", "expansions": ["auto memory", "project memory", "recall", "remember"], "category": "workflow"},
   {"term": "plan", "expansions": ["implementation plan", "architecture", "design doc", "proposal"], "category": "workflow"},
-  {"term": "tenant", "expansions": ["venue", "subdomain", "multi-tenant", "harbour", "time"], "category": "domain"}
+  {"term": "tenant", "expansions": ["venue", "subdomain", "multi-tenant", "harbour", "time"], "category": "domain"},
+  {"term": "pdf", "expansions": ["document", "file", "upload", "reference"], "category": "file-type"},
+  {"term": "nightclub", "expansions": ["venue", "bar", "club", "lounge"], "category": "domain"},
+  {"term": "vancouver", "expansions": ["harbour", "bc", "canada"], "category": "location"},
+  {"term": "upload", "expansions": ["import", "add", "ingest", "file"], "category": "action"},
+  {"term": "catalog", "expansions": ["menu", "inventory", "list", "collection"], "category": "domain"},
+  {"term": "download", "expansions": ["export", "save", "extract"], "category": "action"},
+  {"term": "script", "expansions": ["bash", "shell", "automation", "cli"], "category": "technical"},
+  {"term": "schema", "expansions": ["database schema", "table definition", "migration", "drizzle"], "category": "technical"},
+  {"term": "commit", "expansions": ["git commit", "push", "merge", "branch"], "category": "workflow"},
+  {"term": "debug", "expansions": ["debugging", "troubleshoot", "investigate", "diagnose"], "category": "workflow"},
+  {"term": "setup", "expansions": ["install", "configure", "initialize", "bootstrap"], "category": "workflow"},
+  {"term": "delete", "expansions": ["remove", "drop", "cleanup", "purge"], "category": "action"},
+  {"term": "search", "expansions": ["find", "query", "lookup", "filter"], "category": "action"},
+  {"term": "screenshot", "expansions": ["capture", "snapshot", "screen grab"], "category": "action"},
+  {"term": "build", "expansions": ["compile", "bundle", "webpack", "next build"], "category": "workflow"}
 ]

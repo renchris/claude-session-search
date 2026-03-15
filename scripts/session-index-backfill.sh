@@ -280,7 +280,14 @@ for project_dir in "$CLAUDE_PROJECTS_DIR"/*/; do
         msg_count=$(session_index_extract_transcript_meta "$transcript")
         [ -z "$context_text" ] && [ "${msg_count:-0}" -lt 2 ] && continue
 
+        # Extract enriched data (assistant text, file paths, commands)
+        enriched_data=$(session_index_extract_enriched "$transcript")
+        IFS=$'\t' read -r assistant_text files_changed commands_run <<< "$enriched_data"
+
         ctx_escaped=$(echo "$context_text" | sed "s/'/''/g")
+        at_escaped=$(echo "$assistant_text" | sed "s/'/''/g")
+        fc_escaped=$(echo "$files_changed" | sed "s/'/''/g")
+        cr_escaped=$(echo "$commands_run" | sed "s/'/''/g")
         sid_escaped=$(echo "$sid" | sed "s/'/''/g")
 
         exists=$(sqlite3 "$SESSION_INDEX_DB" "SELECT 1 FROM sessions WHERE session_id='$sid_escaped' LIMIT 1;" 2>/dev/null || echo "")
@@ -289,6 +296,9 @@ for project_dir in "$CLAUDE_PROJECTS_DIR"/*/; do
             sqlite3 "$SESSION_INDEX_DB" <<SQL
 UPDATE sessions SET
     context_text = '$ctx_escaped',
+    assistant_text = CASE WHEN '$at_escaped' != '' THEN '$at_escaped' ELSE assistant_text END,
+    files_changed = CASE WHEN '$fc_escaped' != '' THEN '$fc_escaped' ELSE files_changed END,
+    commands_run = CASE WHEN '$cr_escaped' != '' THEN '$cr_escaped' ELSE commands_run END,
     message_count = CASE WHEN $msg_count > message_count THEN $msg_count ELSE message_count END
 WHERE session_id = '$sid_escaped';
 SQL
@@ -305,9 +315,11 @@ SQL
 
             sqlite3 "$SESSION_INDEX_DB" <<SQL
 INSERT OR IGNORE INTO sessions (session_id, project_path, project_name, summary, first_prompt,
-    context_text, git_branch, created_at, modified_at, message_count, tags, keywords, source, indexed_at)
+    context_text, assistant_text, files_changed, commands_run,
+    git_branch, created_at, modified_at, message_count, tags, keywords, source, indexed_at)
 VALUES ('$sid_escaped', '$pp_escaped', '$pn_escaped', '', '$fp_escaped',
-    '$ctx_escaped', '', '$file_mtime', '$file_mtime', $msg_count, '', '$kw_escaped', 'transcript', '$now');
+    '$ctx_escaped', '$at_escaped', '$fc_escaped', '$cr_escaped',
+    '', '$file_mtime', '$file_mtime', $msg_count, '', '$kw_escaped', 'transcript', '$now');
 SQL
             phase4_inserted=$((phase4_inserted + 1))
         fi

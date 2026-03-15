@@ -108,7 +108,7 @@ echo "3/4  Indexing existing sessions..."
 "$REPO_DIR/scripts/session-index-tag.sh" --regex-only --limit 1000 > /dev/null 2>&1 || true
 
 # Rebuild FTS with tags
-sqlite3 "$CLAUDE_DIR/session-index.db" "DELETE FROM sessions_fts; INSERT INTO sessions_fts (session_id, summary, first_prompt, tags, keywords, project_name, context_text) SELECT session_id, summary, first_prompt, tags, keywords, project_name, context_text FROM sessions;" 2>/dev/null || true
+sqlite3 "$CLAUDE_DIR/session-index.db" "DELETE FROM sessions_fts; INSERT INTO sessions_fts (session_id, summary, first_prompt, tags, keywords, project_name, context_text, assistant_text, files_changed, commands_run) SELECT session_id, summary, first_prompt, tags, keywords, project_name, context_text, assistant_text, files_changed, commands_run FROM sessions;" 2>/dev/null || true
 
 TOTAL=$(sqlite3 "$CLAUDE_DIR/session-index.db" "SELECT COUNT(*) FROM sessions;" 2>/dev/null || echo 0)
 TAGGED=$(sqlite3 "$CLAUDE_DIR/session-index.db" "SELECT COUNT(*) FROM sessions WHERE tagged_at IS NOT NULL;" 2>/dev/null || echo 0)
@@ -139,4 +139,7 @@ if ! command -v fzf &>/dev/null; then
 fi
 if ! python3 -c "import rapidfuzz" 2>/dev/null; then
     echo "Tip:  pip install rapidfuzz   for fuzzy typo correction"
+fi
+if ! python3 -c "import anthropic" 2>/dev/null; then
+    echo "Tip:  pip install anthropic   for LLM query expansion on sparse results"
 fi

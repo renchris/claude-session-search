@@ -27,6 +27,48 @@ from pathlib import Path
 DB_PATH = Path.home() / ".claude" / "session-index.db"
 CACHE_PATH = Path.home() / ".claude" / ".last-search-results.json"
 
+# ─── Stopwords ───────────────────────────────────────────
+
+STOP_WORDS = {
+    "the", "a", "an", "is", "are", "was", "were", "and", "or", "but",
+    "in", "on", "at", "to", "for", "of", "with", "by", "it", "its",
+    "i", "we", "my", "our", "that", "this", "those", "these",
+    "session", "claude", "where", "which", "how", "when", "what",
+    "did", "do", "does", "have", "has", "had", "can", "could",
+    "about", "just", "some", "any", "all", "also", "there", "here",
+}
+# Keep domain-relevant words even if commonly stop-word-like
+KEEP_WORDS = {"not", "without", "no", "from", "after", "before", "during"}
+
+# ─── Verb Expansions ─────────────────────────────────────
+
+VERB_EXPANSIONS = {
+    "debug": ["error", "fix", "trace", "bug"],
+    "debugged": ["error", "fix", "trace", "bug"],
+    "debugging": ["error", "fix", "trace", "bug"],
+    "fix": ["bug", "error", "patch", "repair"],
+    "fixed": ["bug", "error", "patch", "repair"],
+    "upload": ["file", "import", "add", "create"],
+    "uploaded": ["file", "import", "add", "create"],
+    "implement": ["build", "create", "add", "feature"],
+    "implemented": ["build", "create", "add", "feature"],
+    "refactor": ["cleanup", "restructure", "reorganize"],
+    "refactored": ["cleanup", "restructure", "reorganize"],
+    "migrate": ["migration", "schema", "database", "drizzle"],
+    "migrated": ["migration", "schema", "database", "drizzle"],
+    "deploy": ["deployment", "amplify", "fly", "production"],
+    "deployed": ["deployment", "amplify", "fly", "production"],
+    "monitor": ["rum", "cloudwatch", "latency", "metrics"],
+    "research": ["explore", "investigate", "analyze", "deep dive"],
+    "researched": ["explore", "investigate", "analyze", "deep dive"],
+    "review": ["audit", "check", "inspect", "examine"],
+    "reviewed": ["audit", "check", "inspect", "examine"],
+    "create": ["add", "new", "build", "implement"],
+    "created": ["add", "new", "build", "implement"],
+    "change": ["modify", "update", "edit", "alter"],
+    "changed": ["modify", "update", "edit", "alter"],
+}
+
 # ─── Temporal Extraction ──────────────────────────────────
 
 TEMPORAL_PATTERNS = [
@@ -190,6 +232,18 @@ class QueryPipeline:
             self.conn.row_factory = sqlite3.Row
         return self.conn
 
+    @staticmethod
+    def _parse_inline_syntax(query):
+        """Parse @project and #tag shortcuts from query."""
+        project = None
+        tags = []
+        for match in re.finditer(r'@([\w-]+)', query):
+            project = match.group(1)
+        for match in re.finditer(r'#([\w-]+)', query):
+            tags.append(match.group(1))
+        clean = re.sub(r'[@#][\w-]+', '', query).strip()
+        return clean, project, tags
+
     def search(self, raw_query, limit=10, project_filter=None, date_after=None, date_before=None, min_messages=0):
         conn = self._connect()
         synonyms = load_synonyms(conn)
@@ -198,8 +252,13 @@ class QueryPipeline:
         for exps in synonyms.values():
             known_terms.update(exps)
 
+        # 0. Parse inline @project #tag syntax
+        query_text, inline_project, inline_tags = self._parse_inline_syntax(raw_query)
+        if inline_project and not project_filter:
+            project_filter = inline_project
+
         # 1. Normalize
-        normalized = raw_query.strip().lower()
+        normalized = query_text.strip().lower()
 
         # 2. Temporal extraction
         text, auto_date_range = extract_temporal(normalized)
@@ -219,6 +278,25 @@ class QueryPipeline:
         if not compound_tokens:
             compound_tokens = re.findall(r'\S+', text)
 
+        # 3a. Stopword filtering (before synonym expansion)
+        effective_stops = STOP_WORDS - KEEP_WORDS
+        compound_tokens = [t for t in compound_tokens if t not in effective_stops]
+        if not compound_tokens:
+            # If all tokens were stopwords, use original (fallback)
+            compound_tokens = re.findall(r'[a-z0-9][-a-z0-9_.]*[a-z0-9]|[a-z0-9]+', text)
+
+        # 3b. Verb expansion (add search-relevant terms for action verbs)
+        verb_expanded = []
+        for t in compound_tokens:
+            verb_expanded.append(t)
+            if t in VERB_EXPANSIONS:
+                verb_expanded.extend(VERB_EXPANSIONS[t])
+        compound_tokens = list(dict.fromkeys(verb_expanded))
+
+        # 3c. Inject inline #tags as search tokens
+        if inline_tags:
+            compound_tokens.extend(inline_tags)
+
         # 4. Synonym expansion (uses compound tokens like "slide-out" for lookup)
         expanded = expand_synonyms(compound_tokens, synonyms)
 
@@ -237,8 +315,18 @@ class QueryPipeline:
         # 5. Fuzzy correction (only for unknown terms)
         corrected = fuzzy_correct(tokens, known_terms)
 
+        # Store original query tokens (pre-expansion) for NEAR matching
+        self._original_tokens = [t for t in compound_tokens if t not in effective_stops][:6]
+
         # 6. Progressive search
         results = self._progressive_search(corrected, limit, project_filter, auto_date_range, min_messages)
+
+        # 6a. LLM expansion fallback on sparse results
+        if len(results) < 3:
+            llm_results = self._llm_expand_query(raw_query, limit, project_filter, auto_date_range, min_messages)
+            if llm_results:
+                # Merge via RRF
+                results = self._reciprocal_rank_fusion([results, llm_results])[:limit * 2]
 
         # 7. Apply recency boost + depth multiplier and sort
         for r in results:
@@ -252,7 +340,12 @@ class QueryPipeline:
 
     def _progressive_search(self, tokens, limit, project_filter, date_range, min_messages=0):
         """Try increasingly broad queries until we get results."""
+        # Build NEAR strategy from original (pre-expansion) tokens
+        orig = getattr(self, '_original_tokens', tokens[:4])
+
         strategies = [
+            # 0. NEAR proximity match (original terms within 5 tokens of each other)
+            lambda t: (f'NEAR({" ".join(orig)}, 5)' if len(orig) > 1 else None),
             # 1. Phrase match (AND)
             lambda t: " AND ".join(f'"{tok}"' if " " in tok else tok for tok in t),
             # 2. OR match
@@ -263,27 +356,33 @@ class QueryPipeline:
             lambda t: " OR ".join(f"{tok}*" for tok in t if " " not in tok),
         ]
 
+        best_results = []
         for strategy in strategies:
             fts_query = strategy(tokens)
             if not fts_query:
                 continue
             results = self._execute_query(fts_query, limit * 2, project_filter, date_range, min_messages)
             if results:
-                return results
-        return []
+                if len(results) >= 3:
+                    return results  # Sufficient results, stop here
+                # Sparse results — keep but try broader strategies
+                if len(results) > len(best_results):
+                    best_results = results
+        return best_results
 
     def _execute_query(self, fts_query, limit, project_filter, date_range, min_messages=0):
         conn = self._connect()
         # Standalone FTS5 table — join on session_id column
-        # BM25 weights: session_id(0), summary(10), first_prompt(1.5), tags(5), keywords(3), project_name(0.5), context_text(2)
-        # first_prompt reduced 2→1.5 (often garbage like "commit this")
-        # context_text boosted 1.5→2 (rich keywords when summary absent)
-        # project_name reduced 1→0.5 (broad match, rarely decisive)
+        # BM25 weights (10 columns):
+        #   session_id(0), summary(10), first_prompt(1.5), tags(5), keywords(3),
+        #   project_name(0.5), context_text(2), assistant_text(3), files_changed(4), commands_run(2)
         sql = """
             SELECT s.session_id, s.project_path, s.project_name, s.summary,
                    s.first_prompt, s.context_text, s.git_branch, s.created_at,
                    s.modified_at, s.message_count, s.tags, s.keywords, s.source,
-                   bm25(sessions_fts, 0.0, 10.0, 1.5, 5.0, 3.0, 0.5, 2.0) AS bm25_score
+                   bm25(sessions_fts, 0.0, 10.0, 1.5, 5.0, 3.0, 0.5, 2.0, 3.0, 4.0, 2.0) AS bm25_score,
+                   highlight(sessions_fts, 1, '\x02', '\x03') AS summary_hl,
+                   highlight(sessions_fts, 7, '\x02', '\x03') AS assistant_hl
             FROM sessions_fts
             JOIN sessions s ON s.session_id = sessions_fts.session_id
             WHERE sessions_fts MATCH ?
@@ -329,8 +428,97 @@ class QueryPipeline:
                 "keywords": row["keywords"],
                 "source": row["source"],
                 "bm25": abs(row["bm25_score"]),  # BM25 returns negative scores
+                "summary_hl": row["summary_hl"] if "summary_hl" in row.keys() else "",
+                "assistant_hl": row["assistant_hl"] if "assistant_hl" in row.keys() else "",
             })
         return results
+
+    def _llm_expand_query(self, raw_query, limit, project_filter, date_range, min_messages):
+        """Fallback: ask Haiku to rewrite query into keyword variants."""
+        if not os.environ.get("ANTHROPIC_API_KEY"):
+            return []
+        try:
+            import anthropic
+        except ImportError:
+            return []
+        try:
+            client = anthropic.Anthropic()
+            msg = client.messages.create(
+                model="claude-haiku-4-5-20251001",
+                max_tokens=150,
+                messages=[{"role": "user", "content": (
+                    "Rewrite this session search query as 4 lines of keywords (5-7 terms each).\n"
+                    "Each line should capture a different interpretation. Terms only, no explanation.\n\n"
+                    f"Query: {raw_query}"
+                )}],
+            )
+            interpretations = msg.content[0].text.strip().split("\n")
+            all_results = []
+            for interp in interpretations[:4]:
+                interp = interp.strip().lstrip("0123456789.-) ")
+                if not interp:
+                    continue
+                itokens = re.findall(r'[a-z0-9][-a-z0-9_.]*[a-z0-9]|[a-z0-9]+', interp.lower())
+                if not itokens:
+                    continue
+                fts_q = build_fts5_query(itokens)
+                if fts_q:
+                    results = self._execute_query(fts_q, limit, project_filter, date_range, min_messages)
+                    all_results.append(results)
+            if all_results:
+                return self._reciprocal_rank_fusion(all_results)
+        except Exception:
+            pass
+        return []
+
+    @staticmethod
+    def _reciprocal_rank_fusion(ranked_lists, k=60):
+        """Merge multiple ranked lists via Reciprocal Rank Fusion."""
+        scores = {}
+        for ranking in ranked_lists:
+            for rank, result in enumerate(ranking, 1):
+                sid = result["session_id"]
+                if sid not in scores:
+                    scores[sid] = {"result": result, "rrf": 0}
+                scores[sid]["rrf"] += 1.0 / (k + rank)
+        fused = sorted(scores.values(), key=lambda x: x["rrf"], reverse=True)
+        return [item["result"] for item in fused]
+
+    def suggest_alternatives(self, raw_query, limit=4):
+        """When search fails, suggest queries that might work."""
+        tokens = re.findall(r'[a-z0-9][-a-z0-9_.]*[a-z0-9]|[a-z0-9]+', raw_query.lower())
+        effective_stops = STOP_WORDS - KEEP_WORDS
+        tokens = [t for t in tokens if t not in effective_stops]
+        suggestions = []
+
+        # Try each token individually
+        for token in tokens:
+            fts_q = build_fts5_query([token])
+            if fts_q:
+                results = self._execute_query(fts_q, 1, None, None)
+                if results:
+                    count = len(self._execute_query(fts_q, 50, None, None))
+                    suggestions.append((token, count))
+
+        # Try dropping one term at a time
+        if len(tokens) > 2:
+            for i in range(len(tokens)):
+                subset = tokens[:i] + tokens[i + 1:]
+                fts_q = build_fts5_query(subset)
+                if fts_q:
+                    results = self._execute_query(fts_q, 1, None, None)
+                    if results:
+                        count = len(self._execute_query(fts_q, 50, None, None))
+                        suggestions.append((" ".join(subset), count))
+
+        # Deduplicate and sort by match count
+        seen = set()
+        unique = []
+        for term, count in sorted(suggestions, key=lambda x: -x[1]):
+            if term not in seen:
+                seen.add(term)
+                unique.append((term, count))
+        return unique[:limit]
 
     def preview(self, session_id):
         conn = self._connect()
@@ -592,6 +780,13 @@ def _build_description(r):
         if is_useful(cleaned):
             return cleaned
 
+    # 4. Assistant text (Claude's responses — outcomes, explanations)
+    assistant = (r.get("assistant_hl") or r.get("assistant_text") or "").strip()
+    if assistant and len(assistant) > 30:
+        cleaned = clean_text(assistant)
+        if is_useful(cleaned):
+            return cleaned[:300]
+
     return "(no description)"
 
 
@@ -610,9 +805,21 @@ def _pad_visible(text, width, align='left'):
     return text + ' ' * pad
 
 
-def format_table(results, elapsed_ms=0):
+def _render_highlights(text, bold_start="\033[1;33m", bold_end="\033[0m"):
+    """Convert \x02...\x03 FTS5 highlight markers to ANSI bold."""
+    return text.replace("\x02", bold_start).replace("\x03", bold_end)
+
+
+def format_table(results, elapsed_ms=0, pipeline=None, raw_query=None):
     if not results:
         print("No results found.")
+        if pipeline and raw_query:
+            suggestions = pipeline.suggest_alternatives(raw_query)
+            if suggestions:
+                print()
+                print("  Try instead:")
+                for term, count in suggestions:
+                    print(f"    claude-search \"{term}\"  ({count} results)")
         return
 
     color = _use_color()
@@ -671,8 +878,11 @@ def format_table(results, elapsed_ms=0):
         tags_raw = r.get("tags", "")
         branch = (r.get("git_branch") or "").strip()
 
-        # Build smart description
+        # Build smart description (use highlighted summary if available)
         desc_raw = _build_description(r)
+        # Apply FTS5 highlight markers for matched terms
+        if r.get("summary_hl") and "\x02" in r.get("summary_hl", ""):
+            desc_raw = _render_highlights(r["summary_hl"], f"{BOLD}{GREEN}", R)
 
         # Format message count (right-aligned number within COL_MSGS)
         if msgs >= 1000:
@@ -989,7 +1199,7 @@ def main():
         elif args.format == "json":
             format_json(results)
         else:
-            format_table(results, elapsed_ms)
+            format_table(results, elapsed_ms, pipeline=pipeline, raw_query=query)
 
     finally:
         pipeline.close()

@@ -74,6 +74,13 @@ if [ -n "$TRANSCRIPT_PATH" ] && [ -f "$TRANSCRIPT_PATH" ]; then
     CONTEXT_TEXT=$(session_index_extract_context "$TRANSCRIPT_PATH" 5)
 fi
 
+# Extract enriched data (assistant text, file paths, commands)
+ASSISTANT_TEXT="" FILES_CHANGED="" COMMANDS_RUN=""
+if [ -n "$TRANSCRIPT_PATH" ] && [ -f "$TRANSCRIPT_PATH" ]; then
+    ENRICHED=$(session_index_extract_enriched "$TRANSCRIPT_PATH")
+    IFS=$'\t' read -r ASSISTANT_TEXT FILES_CHANGED COMMANDS_RUN <<< "$ENRICHED"
+fi
+
 # Extract keywords
 KEYWORDS=$(session_index_extract_keywords "$SUMMARY $FIRST_PROMPT $CONTEXT_TEXT")
 
@@ -91,7 +98,10 @@ session_index_upsert_with_fts \
     "" \
     "$KEYWORDS" \
     "sessions-index" \
-    "$CONTEXT_TEXT"
+    "$CONTEXT_TEXT" \
+    "$ASSISTANT_TEXT" \
+    "$FILES_CHANGED" \
+    "$COMMANDS_RUN"
 
 session_index_log "Indexed session $SESSION_ID ($PROJECT_NAME, ${MSG_COUNT} msgs)"
 exit 0

@@ -278,8 +278,8 @@ class QueryPipeline:
         # BM25 weights: session_id(0), summary(10), first_prompt(2), tags(5), keywords(3), project_name(1), context_text(1.5)
         sql = """
             SELECT s.session_id, s.project_path, s.project_name, s.summary,
-                   s.first_prompt, s.git_branch, s.created_at, s.modified_at,
-                   s.message_count, s.tags, s.keywords, s.source,
+                   s.first_prompt, s.context_text, s.git_branch, s.created_at,
+                   s.modified_at, s.message_count, s.tags, s.keywords, s.source,
                    bm25(sessions_fts, 0.0, 10.0, 2.0, 5.0, 3.0, 1.0, 1.5) AS bm25_score
             FROM sessions_fts
             JOIN sessions s ON s.session_id = sessions_fts.session_id
@@ -317,6 +317,7 @@ class QueryPipeline:
                 "project_name": row["project_name"],
                 "summary": row["summary"],
                 "first_prompt": row["first_prompt"],
+                "context_text": row["context_text"],
                 "git_branch": row["git_branch"],
                 "created_at": row["created_at"],
                 "modified_at": row["modified_at"],
@@ -478,6 +479,7 @@ def _wrap_lines(text, width, max_lines=3):
     while text and len(lines) < max_lines:
         if len(text) <= width:
             lines.append(text)
+            text = ""
             break
         break_at = text[:width].rfind(" ")
         if break_at <= 0:
@@ -489,7 +491,7 @@ def _wrap_lines(text, width, max_lines=3):
         last = lines[-1]
         if len(last) + len(text) + 1 > width:
             lines[-1] = _smart_truncate(last + " " + text, width)
-    return lines if lines else ["(no summary)"]
+    return lines if lines else [""]
 
 
 def _truncate_tags(tags_str, max_len):
@@ -515,6 +517,90 @@ def _truncate_tags(tags_str, max_len):
     return ", ".join(result)
 
 
+def _build_description(r):
+    """Build the best available description from session data.
+
+    Priority: summary > cleaned context_text > first_prompt.
+    Returns a single cleaned string suitable for multi-line wrapping.
+    """
+    summary = (r.get("summary") or "").strip()
+    context = (r.get("context_text") or "").strip()
+    first_prompt = (r.get("first_prompt") or "").strip()
+
+    # Prefixes that add no information
+    noise_prefixes = [
+        "Implement the following plan:",
+        "Implement the following plan: ",
+        "/compact",
+        "[Pasted text #1",
+        "Wrote 1 memory",
+        "Wrote 2 memories",
+        "Wrote 3 memories",
+    ]
+    # Noise fragments that can appear anywhere at the start
+    noise_patterns = [
+        r'^\(ctrl\+o to expand\)\s*',
+        r'^⏺\s*',
+        r'^\[Pasted text #\d+ \+\d+ lines\]\s*',
+    ]
+
+    def clean_text(text):
+        """Strip noise prefixes, markdown formatting, and normalize whitespace."""
+        for prefix in noise_prefixes:
+            if text.startswith(prefix):
+                text = text[len(prefix):].strip()
+                # After stripping, if it starts with a markdown header or bullet, strip that too
+                text = re.sub(r'^#+\s+', '', text)
+                text = re.sub(r'^[-*]\s+', '', text)
+        for pat in noise_patterns:
+            text = re.sub(pat, '', text)
+        # Strip markdown bold/italic markers
+        text = re.sub(r'\*{1,2}([^*]+)\*{1,2}', r'\1', text)
+        # Strip markdown backticks
+        text = text.replace('`', '')
+        # Collapse whitespace
+        text = " ".join(text.split())
+        return text
+
+    def is_useful(text):
+        """Check if text provides meaningful session identification."""
+        if not text or len(text) < 8:
+            return False
+        # Single-word commands or dots are not useful
+        if text in (".", "..", "yes", "no", "ok", "commit this", "push", "No prompt"):
+            return False
+        if text.startswith("[Pasted text"):
+            return False
+        return True
+
+    # 1. Summary is best (Claude-generated session description)
+    if is_useful(summary):
+        return summary
+
+    # 2. Context text (first user messages from transcript — rich but needs cleaning)
+    if context and len(context) > 30:
+        cleaned = clean_text(context)
+        if is_useful(cleaned):
+            return cleaned
+
+    # 3. First prompt (often garbage but sometimes useful)
+    if is_useful(first_prompt):
+        cleaned = clean_text(first_prompt)
+        if is_useful(cleaned):
+            return cleaned
+
+    return "(no description)"
+
+
+def _pad_visible(text, width):
+    """Pad text to fixed visible width, accounting for ANSI escape codes."""
+    visible = re.sub(r'\033\[[0-9;]*m', '', text)
+    pad = width - len(visible)
+    if pad <= 0:
+        return text
+    return text + ' ' * pad
+
+
 def format_table(results, elapsed_ms=0):
     if not results:
         print("No results found.")
@@ -525,12 +611,14 @@ def format_table(results, elapsed_ms=0):
     BOLD = "\033[1m" if color else ""
     DIM = "\033[2m" if color else ""
     GREEN = "\033[32m" if color else ""
-    YELLOW = "\033[33m" if color else ""
     CYAN = "\033[36m" if color else ""
     BLUE = "\033[38;5;33m" if color else ""
     DIM_MAGENTA = "\033[2;35m" if color else ""
+    WHITE = "\033[38;5;255m" if color else ""
 
-    H = "─"
+    H = "\u2500"  # ─
+    TL, TR, BL, BR = "\u256d", "\u256e", "\u2570", "\u256f"  # ╭╮╰╯
+    V = "\u2502"  # │
 
     # Terminal width (capped at 120 per deploy-status convention)
     try:
@@ -539,65 +627,78 @@ def format_table(results, elapsed_ms=0):
         tw = 80
     tw = min(tw, 120)
     cw = tw - 4  # content width (2 indent + 2 margin)
+    desc_width = cw - 6  # indent for description lines (6 = "      ")
 
-    # Summary line gets full content width (no ID interference)
-    summary_width = cw
-
-    # ─── Header ───────────────────────────────────────────
-    title = f"{BOLD}Session Search{R}"
-    meta = f"{DIM}{len(results)} results · {elapsed_ms}ms{R}"
-    spacing = cw - len("Session Search") - len(f"{len(results)} results · {elapsed_ms}ms")
+    # ─── Header Card ──────────────────────────────────────
+    title_text = "Session Search"
+    meta_text = f"{len(results)} results \u00b7 {elapsed_ms}ms"
+    inner = cw - 2  # inside box padding
+    spacing = inner - len(title_text) - len(meta_text)
     print()
-    print(f"  {title}{' ' * max(2, spacing)}{meta}")
-    print(f"  {DIM}{H * cw}{R}")
+    print(f"  {DIM}{TL}{H * cw}{TR}{R}")
+    print(f"  {DIM}{V}{R} {BOLD}{title_text}{R}{' ' * max(1, spacing)}{DIM}{meta_text}{R} {DIM}{V}{R}")
+    print(f"  {DIM}{BL}{H * cw}{BR}{R}")
 
-    # ─── Result Cards (fixed 4-line height) ───────────────
-    # Line 1: DIM metadata row — visual anchor + separator
-    #         [idx]  ·  [age] ago  ·  [msgs] msgs  ·  [session_id]
-    # Line 2: Summary (default white, full width, single line)
-    # Line 3: Tags (dim magenta) or blank
-    # Line 4: Dim thin separator
+    # ─── Result Cards ─────────────────────────────────────
+    # Each result is a fixed-height block:
+    #   Line 1: rank + summary title (bold white) — the primary scan target
+    #   Line 2: description continuation (if multi-line)
+    #   Line 3: description continuation (if multi-line)
+    #   Line 4: metadata — age · msgs · tags · session_id
+    #   Line 5: separator
     for i, r in enumerate(results, 1):
         age = format_relative_time(r["created_at"], compact=True)
         msgs = r["message_count"]
         sid = r["session_id"]
         is_legacy = sid.startswith("legacy-")
         short_id = "*" if is_legacy else sid[:8]
-        summary_raw = r["summary"] or r["first_prompt"] or "(no summary)"
-        tags_str = _truncate_tags(r.get("tags", ""), summary_width)
+        tags_str = _truncate_tags(r.get("tags", ""), 40)
+        branch = (r.get("git_branch") or "").strip()
 
-        # Format msgs with unit
+        # Build smart description
+        desc_raw = _build_description(r)
+
+        # Format message count
         if msgs >= 1000:
             msgs_display = f"{msgs / 1000:.1f}k"
         else:
             msgs_display = str(msgs)
 
-        # Msgs color: cyan for >=100, dim otherwise
+        # Wrap description into up to 3 lines
+        rank_prefix = f"{i:>2}  "  # "  1  " = 4 chars
+        first_line_width = cw - len(rank_prefix)
+        desc_lines = _wrap_lines(desc_raw, first_line_width, max_lines=3)
+
+        # Line 1: rank + first line of description (bold white = primary content)
+        print(f"  {BOLD}{WHITE}{rank_prefix}{desc_lines[0]}{R}")
+
+        # Lines 2-3: continuation lines (same weight, indented to align)
+        for line in desc_lines[1:]:
+            print(f"  {'':4}{line}")
+
+        # Metadata line: age · msgs · tags · session_id
+        # Build as a single string with explicit color control
+        meta = f"{DIM}{age}"
         if msgs >= 100:
-            msgs_styled = f"{BOLD}{CYAN}{msgs_display}{R}"
+            meta += f" \u00b7 {R}{BOLD}{CYAN}{msgs_display}{R}{DIM} msgs"
         else:
-            msgs_styled = f"{msgs_display}"
-
-        # Line 1: metadata row (all dim, ID in blue)
-        print(f"  {DIM}{i:>2}  ·  {age} ago  ·  {R}{msgs_styled}{DIM} msgs  ·  {R}{BLUE}{short_id}{R}")
-
-        # Line 2: summary (primary content, full width, single line)
-        summary = _smart_truncate(summary_raw, summary_width)
-        print(f"  {summary}")
-
-        # Line 3: tags or blank
+            meta += f" \u00b7 {msgs_display} msgs"
         if tags_str:
-            print(f"  {DIM_MAGENTA}{tags_str}{R}")
-        else:
-            print()
+            meta += f" \u00b7 {R}{DIM_MAGENTA}{tags_str}{R}{DIM}"
+        if branch and branch not in ("main", "master"):
+            meta += f" \u00b7 {branch}"
+        meta += f" \u00b7 {R}{BLUE}{short_id}{R}"
+        print(f"      {meta}")
 
-        # Line 4: separator (skip after last result)
+        # Separator (skip after last result)
         if i < len(results):
             print(f"  {DIM}{H * cw}{R}")
 
-    # ─── Footer ───────────────────────────────────────────
-    print(f"  {DIM}{H * cw}{R}")
-    print(f"  {GREEN}●{R}  {DIM}--resume N to open  ·  --fzf for interactive{R}")
+    # ─── Footer Card ──────────────────────────────────────
+    print(f"  {DIM}{TL}{H * cw}{TR}{R}")
+    footer_text = f"claude-search --resume N  \u00b7  --fzf for interactive"
+    print(f"  {DIM}{V}{R} {GREEN}\u25cf{R}  {DIM}{footer_text}{R}{' ' * max(0, inner - len(footer_text) - 4)} {DIM}{V}{R}")
+    print(f"  {DIM}{BL}{H * cw}{BR}{R}")
     print()
 
 
@@ -606,11 +707,11 @@ def format_fzf(results):
     for r in results:
         age = format_relative_time(r["created_at"])
         proj = r["project_name"][:20]
-        summary = (r["summary"] or r["first_prompt"] or "(no summary)")[:70]
+        desc = _build_description(r)[:70]
         branch = (r["git_branch"] or "")[:12]
         tags = r.get("tags", "")[:30]
         # session_id is last field (hidden, used for --preview)
-        print(f"\033[33m{age:<8}\033[0m \033[35m{proj:<20}\033[0m {summary:<70} \033[32m{branch:<12}\033[0m {tags}\t{r['session_id']}")
+        print(f"\033[33m{age:<8}\033[0m \033[35m{proj:<20}\033[0m {desc:<70} \033[32m{branch:<12}\033[0m {tags}\t{r['session_id']}")
 
 
 def format_json(results):

@@ -818,35 +818,46 @@ def format_preview(session):
     if not session:
         print("Session not found.")
         return
-    print(f"\033[1;33mSession\033[0m: {session['session_id']}")
-    print(f"\033[1;35mProject\033[0m: {session['project_name']} ({session['project_path']})")
-    print(f"\033[1;32mBranch\033[0m:  {session.get('git_branch', '')}")
-    print(f"\033[1mCreated\033[0m: {session['created_at']}  |  Modified: {session['modified_at']}")
-    print(f"\033[1mMessages\033[0m: {session['message_count']}  |  Source: {session['source']}")
+
+    # ─── Compact metadata header ─────────────────────────
+    age = format_relative_time(session['created_at'], compact=True)
+    msgs = session['message_count']
+    sid = session['session_id'][:8]
+    branch = (session.get('git_branch') or '').strip()
+    proj = session['project_name'][:30]
+
+    print(f"\033[1;33m{proj}\033[0m  \033[2m{age} \u00b7 {msgs} msgs \u00b7 {sid}\033[0m")
+    if branch and branch not in ("main", "master"):
+        print(f"\033[2;32m{branch}\033[0m")
     if session.get("tags"):
-        print(f"\033[1mTags\033[0m:    {session['tags']}")
+        tags_display = ", ".join(t.strip() for t in session['tags'].split(',')[:5])
+        print(f"\033[2;35m{tags_display}\033[0m")
 
-    # ─── Description (smart fallback) ─────────────────────
-    print()
+    # ─── Description (3 lines max, wrapped) ──────────────
     desc = _build_description(session)
-    print(f"\033[1;33mDescription\033[0m:")
-    print(desc[:600])
+    if desc and desc != "(no description)":
+        print()
+        print(f"\033[1;33mAbout\033[0m:")
+        for line in _wrap_lines(desc, 76, max_lines=3):
+            print(f"  {line}")
 
-    # ─── Last Messages (from transcript) ──────────────────
+    # ─── Conversation Timeline (from transcript) ─────────
     last_msgs = _extract_last_messages(
-        session["session_id"], session.get("project_path", "")
+        session["session_id"], session.get("project_path", ""), count=7
     )
     if last_msgs:
         print()
-        print(f"\033[1;35mRecent Activity\033[0m ({len(last_msgs)} last messages):")
-        for msg in last_msgs:
-            # Clean and truncate
-            clean = " ".join(msg.split())[:200]
-            print(f"  \033[2m›\033[0m {clean}")
+        print(f"\033[1;35mRecent Messages\033[0m:")
+        for i, msg in enumerate(last_msgs, 1):
+            clean = " ".join(msg.split())
+            clean = _smart_truncate(clean, 120)
+            print(f"  \033[2m{i}.\033[0m {clean}")
     elif session.get("first_prompt"):
-        print()
-        print(f"\033[1;35mFirst Prompt\033[0m:")
-        print(session["first_prompt"][:300])
+        fp = " ".join(session["first_prompt"].split())[:200]
+        if len(fp) > 10:
+            print()
+            print(f"\033[1;35mFirst Message\033[0m:")
+            print(f"  {fp}")
 
 
 # ─── Result Caching ──────────────────────────────────────

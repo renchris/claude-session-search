@@ -12,6 +12,7 @@ Usage:
     session-index-tag.py --limit 50                   # Batch size
     session-index-tag.py --regex-only                 # Skip API
     session-index-tag.py --quiet                      # No TTY output
+    session-index-tag.py --retag-summaries            # Fill empty summaries via Haiku
 """
 
 import argparse
@@ -443,6 +444,7 @@ def print_mode_banner(
     api_key: str,
     dry_run: bool,
     project_filter: str,
+    retag_summaries: bool = False,
 ) -> None:
     """Print the mode banner at startup."""
     right = f"{total} queued"
@@ -452,6 +454,8 @@ def print_mode_banner(
     title = "Session Tagger"
     if dry_run:
         title = "Session Tagger (dry run)"
+    elif retag_summaries:
+        title = "Retag Summaries"
 
     print()
     print(_box_top())
@@ -679,6 +683,11 @@ def main() -> None:
         action="store_true",
         help="suppress per-item output (for install.sh)",
     )
+    parser.add_argument(
+        "--retag-summaries",
+        action="store_true",
+        help="re-process tagged sessions that have empty summaries (requires Haiku API)",
+    )
     args = parser.parse_args()
 
     # ─── Validate database exists ─────────────────────────────────
@@ -708,14 +717,56 @@ def main() -> None:
     api_key = os.environ.get("ANTHROPIC_API_KEY", "")
     effective_regex_only = args.regex_only or not api_key
 
-    # ─── Query untagged sessions ──────────────────────────────────
+    # ─── Validate --retag-summaries constraints ────────────────────
+
+    if args.retag_summaries and effective_regex_only:
+        print(
+            "--retag-summaries requires Haiku API. Set ANTHROPIC_API_KEY.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    # ─── Query sessions ────────────────────────────────────────────
 
     conn = sqlite3.connect(str(DB_PATH))
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA busy_timeout=5000")
 
-    if args.project:
+    if args.retag_summaries:
+        # Target sessions that have tags but empty summaries
+        if args.project:
+            query = (
+                "SELECT session_id, summary, first_prompt, project_name, "
+                "substr(context_text,1,500) as context_text, "
+                "substr(assistant_text,1,500) as assistant_text "
+                "FROM sessions WHERE (summary = '' OR summary IS NULL) "
+                "AND project_name LIKE ? "
+                "ORDER BY modified_at DESC LIMIT ?"
+            )
+            rows = conn.execute(query, (f"%{args.project}%", args.limit)).fetchall()
+        else:
+            query = (
+                "SELECT session_id, summary, first_prompt, project_name, "
+                "substr(context_text,1,500) as context_text, "
+                "substr(assistant_text,1,500) as assistant_text "
+                "FROM sessions WHERE (summary = '' OR summary IS NULL) "
+                "ORDER BY modified_at DESC LIMIT ?"
+            )
+            rows = conn.execute(query, (args.limit,)).fetchall()
+
+        if args.project:
+            total_untagged = conn.execute(
+                "SELECT COUNT(*) FROM sessions WHERE (summary = '' OR summary IS NULL) "
+                "AND project_name LIKE ?",
+                (f"%{args.project}%",),
+            ).fetchone()[0]
+        else:
+            total_untagged = conn.execute(
+                "SELECT COUNT(*) FROM sessions WHERE summary = '' OR summary IS NULL"
+            ).fetchone()[0]
+
+    elif args.project:
         query = (
             "SELECT session_id, summary, first_prompt, project_name, "
             "substr(context_text,1,500) as context_text, "
@@ -724,6 +775,10 @@ def main() -> None:
             "ORDER BY modified_at DESC LIMIT ?"
         )
         rows = conn.execute(query, (f"%{args.project}%", args.limit)).fetchall()
+        total_untagged = conn.execute(
+            "SELECT COUNT(*) FROM sessions WHERE tagged_at IS NULL AND project_name LIKE ?",
+            (f"%{args.project}%",),
+        ).fetchone()[0]
     else:
         query = (
             "SELECT session_id, summary, first_prompt, project_name, "
@@ -733,14 +788,6 @@ def main() -> None:
             "ORDER BY modified_at DESC LIMIT ?"
         )
         rows = conn.execute(query, (args.limit,)).fetchall()
-
-    # Count total untagged (for banner)
-    if args.project:
-        total_untagged = conn.execute(
-            "SELECT COUNT(*) FROM sessions WHERE tagged_at IS NULL AND project_name LIKE ?",
-            (f"%{args.project}%",),
-        ).fetchone()[0]
-    else:
         total_untagged = conn.execute(
             "SELECT COUNT(*) FROM sessions WHERE tagged_at IS NULL"
         ).fetchone()[0]
@@ -762,7 +809,8 @@ def main() -> None:
 
     if not args.quiet:
         print_mode_banner(
-            total_untagged, effective_regex_only, api_key, args.dry_run, args.project
+            total_untagged, effective_regex_only, api_key, args.dry_run, args.project,
+            retag_summaries=args.retag_summaries,
         )
 
     # ─── Hide cursor during progress ──────────────────────────────
@@ -862,31 +910,47 @@ def main() -> None:
 
         # Check which sessions currently have empty summaries (for counting new summaries)
         successful = [r for r in results if r.success]
-        haiku_with_summary = [
-            r for r in successful if r.method == "haiku" and r.summary
-        ]
 
-        if haiku_with_summary:
-            sids_with_haiku_summary = [r.session_id for r in haiku_with_summary]
-            placeholders = ",".join("?" * len(sids_with_haiku_summary))
-            existing = conn.execute(
-                f"SELECT session_id FROM sessions "
-                f"WHERE session_id IN ({placeholders}) AND summary = ''",
-                sids_with_haiku_summary,
-            ).fetchall()
-            summaries_added = len(existing)
+        if not args.retag_summaries:
+            # Normal mode: pre-count summaries that will be added
+            haiku_with_summary = [
+                r for r in successful if r.method == "haiku" and r.summary
+            ]
+
+            if haiku_with_summary:
+                sids_with_haiku_summary = [r.session_id for r in haiku_with_summary]
+                placeholders = ",".join("?" * len(sids_with_haiku_summary))
+                existing = conn.execute(
+                    f"SELECT session_id FROM sessions "
+                    f"WHERE session_id IN ({placeholders}) AND summary = ''",
+                    sids_with_haiku_summary,
+                ).fetchall()
+                summaries_added = len(existing)
 
         # Batch update in a single transaction
         try:
             conn.execute("BEGIN TRANSACTION")
             for result in successful:
-                tags_str = ",".join(result.tags)
-                conn.execute(
-                    "UPDATE sessions SET tags=?, "
-                    "summary=CASE WHEN ? != '' AND summary = '' THEN ? ELSE summary END, "
-                    "tagged_at=? WHERE session_id=?",
-                    (tags_str, result.summary, result.summary, now, result.session_id),
-                )
+                if args.retag_summaries:
+                    # Only update summary; preserve existing tags
+                    if result.summary:
+                        conn.execute(
+                            "UPDATE sessions SET "
+                            "summary=?, "
+                            "tags=CASE WHEN tags IS NULL OR tags = '' THEN ? ELSE tags END, "
+                            "tagged_at=COALESCE(tagged_at, ?) "
+                            "WHERE session_id=?",
+                            (result.summary, ",".join(result.tags), now, result.session_id),
+                        )
+                        summaries_added += 1
+                else:
+                    tags_str = ",".join(result.tags)
+                    conn.execute(
+                        "UPDATE sessions SET tags=?, "
+                        "summary=CASE WHEN ? != '' AND summary = '' THEN ? ELSE summary END, "
+                        "tagged_at=? WHERE session_id=?",
+                        (tags_str, result.summary, result.summary, now, result.session_id),
+                    )
             conn.execute("COMMIT")
         except sqlite3.Error as e:
             conn.execute("ROLLBACK")

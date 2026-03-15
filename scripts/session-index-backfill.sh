@@ -54,13 +54,24 @@ _backfill_start=$(_ui_now)
 # Count existing sessions for the header
 _existing_total=$(sqlite3 "$SESSION_INDEX_DB" "SELECT COUNT(*) FROM sessions;" 2>/dev/null || echo 0)
 
-# Count transcript files for Phase 4 progress
+# Count transcript files for Phase 4 progress (flat + subdirectory layouts)
 _transcript_total=0
 for _pd in "$CLAUDE_PROJECTS_DIR"/*/; do
+    # Flat layout: {project_dir}/{session_id}.jsonl
     for _tf in "$_pd"*.jsonl; do
         [ -f "$_tf" ] || continue
         _fn=$(basename "$_tf" .jsonl)
         [[ "$_fn" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]] || continue
+        _transcript_total=$((_transcript_total + 1))
+    done
+    # Subdirectory layout: {project_dir}/{session_id}/transcript.jsonl
+    for _sd in "$_pd"*/; do
+        [ -d "$_sd" ] || continue
+        _dn=$(basename "$_sd")
+        [[ "$_dn" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]] || continue
+        [ -f "$_sd/transcript.jsonl" ] || continue
+        # Don't double-count if flat file also exists
+        [ -f "$_pd${_dn}.jsonl" ] && continue
         _transcript_total=$((_transcript_total + 1))
     done
 done
@@ -402,10 +413,32 @@ else
         proj_path=$(echo "$dir_name" | sed 's/^-/\//' | sed 's/-/\//g')
         proj_name=$(basename "$proj_path")
 
+        # Collect transcripts: flat ({sid}.jsonl) and subdirectory ({sid}/transcript.jsonl)
+        _p4_transcripts=()
+        _p4_sids=()
+
         for transcript in "$project_dir"*.jsonl; do
             [ -f "$transcript" ] || continue
             sid=$(basename "$transcript" .jsonl)
             [[ "$sid" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]] || continue
+            _p4_transcripts+=("$transcript")
+            _p4_sids+=("$sid")
+        done
+
+        for subdir in "$project_dir"*/; do
+            [ -d "$subdir" ] || continue
+            sid=$(basename "$subdir")
+            [[ "$sid" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]] || continue
+            [ -f "$subdir/transcript.jsonl" ] || continue
+            # Skip if flat file already queued (prefer flat — same content)
+            [ -f "$project_dir${sid}.jsonl" ] && continue
+            _p4_transcripts+=("$subdir/transcript.jsonl")
+            _p4_sids+=("$sid")
+        done
+
+        for _idx in "${!_p4_transcripts[@]}"; do
+            transcript="${_p4_transcripts[$_idx]}"
+            sid="${_p4_sids[$_idx]}"
 
             _p4_processed=$((_p4_processed + 1))
             ui_should_update "$_p4_processed" "$_transcript_total" && \
@@ -484,10 +517,107 @@ SQL
     ui_phase_done "Phase 4: Transcript enrichment" "$_p4_summary" "$_p4_start"
 fi
 
-# ─── Phase 5: Synonyms + FTS rebuild ──────────────────────
+# ─── Phase 5: DB-driven enrichment gap-fill ───────────────
+# Queries sessions with empty assistant_text, locates their transcript,
+# and populates assistant_text, files_changed, commands_run.
+# Catches sessions that Phase 4 missed (e.g., transcript in unexpected
+# location, or session discovered in Phases 1-3 without a matching
+# transcript file in the standard scan paths).
 
 _p5_start=$(_ui_now)
-ui_phase_active_simple "Phase 5: FTS rebuild" "loading synonyms..." "$_p5_start"
+phase5_enriched=0
+phase5_skipped=0
+phase5_nofound=0
+
+# Query sessions missing assistant_text
+_p5_total=$(sqlite3 "$SESSION_INDEX_DB" \
+    "SELECT COUNT(*) FROM sessions WHERE assistant_text = '' AND session_id NOT LIKE 'legacy-%' $SINCE_FILTER;" \
+    2>/dev/null || echo 0)
+
+if [ "$_p5_total" -eq 0 ]; then
+    ui_phase_skip "Phase 5: Enrichment gap-fill" "no gaps"
+else
+    ui_phase_active "Phase 5: Enrichment gap-fill" 0 "$_p5_total" "$_p5_start"
+    _p5_processed=0
+
+    # Dump session_id + project_path pairs to temp file
+    _P5_TMP=$(mktemp)
+    sqlite3 -separator $'\t' "$SESSION_INDEX_DB" \
+        "SELECT session_id, project_path FROM sessions WHERE assistant_text = '' AND session_id NOT LIKE 'legacy-%' $SINCE_FILTER;" \
+        > "$_P5_TMP" 2>/dev/null || true
+
+    while IFS=$'\t' read -r sid proj_path; do
+        _p5_processed=$((_p5_processed + 1))
+        ui_should_update "$_p5_processed" "$_p5_total" && \
+            ui_phase_active "Phase 5: Enrichment gap-fill" "$_p5_processed" "$_p5_total" "$_p5_start"
+
+        [ -z "$sid" ] && continue
+
+        # Encode project_path to directory name: /Users/foo/bar → -Users-foo-bar
+        encoded_path=$(echo "$proj_path" | sed 's|/|-|g')
+        base_dir="$CLAUDE_PROJECTS_DIR/$encoded_path"
+
+        # Locate transcript: try flat file, then subdirectory, then find fallback
+        transcript=""
+        if [ -f "$base_dir/${sid}.jsonl" ]; then
+            transcript="$base_dir/${sid}.jsonl"
+        elif [ -f "$base_dir/${sid}/transcript.jsonl" ]; then
+            transcript="$base_dir/${sid}/transcript.jsonl"
+        else
+            # Fallback: search all project dirs for this session ID
+            for _pd in "$CLAUDE_PROJECTS_DIR"/*/; do
+                if [ -f "$_pd${sid}.jsonl" ]; then
+                    transcript="$_pd${sid}.jsonl"
+                    break
+                elif [ -f "$_pd${sid}/transcript.jsonl" ]; then
+                    transcript="$_pd${sid}/transcript.jsonl"
+                    break
+                fi
+            done
+        fi
+
+        if [ -z "$transcript" ] || [ ! -f "$transcript" ]; then
+            phase5_nofound=$((phase5_nofound + 1))
+            continue
+        fi
+
+        # Extract enriched data
+        enriched_data=$(session_index_extract_enriched "$transcript")
+        IFS=$'\t' read -r assistant_text files_changed commands_run <<< "$enriched_data"
+
+        # Skip if extraction returned nothing
+        if [ -z "$assistant_text" ] && [ -z "$files_changed" ] && [ -z "$commands_run" ]; then
+            phase5_skipped=$((phase5_skipped + 1))
+            continue
+        fi
+
+        at_escaped=$(echo "$assistant_text" | sed "s/'/''/g")
+        fc_escaped=$(echo "$files_changed" | sed "s/'/''/g")
+        cr_escaped=$(echo "$commands_run" | sed "s/'/''/g")
+        sid_escaped=$(echo "$sid" | sed "s/'/''/g")
+
+        sqlite3 "$SESSION_INDEX_DB" <<SQL
+UPDATE sessions SET
+    assistant_text = '$at_escaped',
+    files_changed = '$fc_escaped',
+    commands_run = '$cr_escaped'
+WHERE session_id = '$sid_escaped' AND assistant_text = '';
+SQL
+        phase5_enriched=$((phase5_enriched + 1))
+    done < "$_P5_TMP"
+
+    rm -f "$_P5_TMP"
+
+    _p5_summary="$phase5_enriched enriched"
+    [ "$phase5_skipped" -gt 0 ] && _p5_summary="$_p5_summary, $phase5_skipped empty"
+    [ "$phase5_nofound" -gt 0 ] && _p5_summary="$_p5_summary, $phase5_nofound no transcript"
+    ui_phase_done "Phase 5: Enrichment gap-fill" "$_p5_summary" "$_p5_start"
+fi
+
+# ─── Phase 6: Synonyms + FTS rebuild ──────────────────────
+
+_p6_start=$(_ui_now)
+ui_phase_active_simple "Phase 6: FTS rebuild" "loading synonyms..." "$_p6_start"
 
 synonyms_file="$REPO_DIR/synonyms/default.json"
 _syn_count=0
@@ -496,13 +626,13 @@ if [ -f "$synonyms_file" ]; then
     _syn_count=$(sqlite3 "$SESSION_INDEX_DB" "SELECT COUNT(*) FROM synonyms;" 2>/dev/null || echo 0)
 fi
 
-ui_phase_active_simple "Phase 5: FTS rebuild" "rebuilding index..." "$_p5_start"
+ui_phase_active_simple "Phase 6: FTS rebuild" "rebuilding index..." "$_p6_start"
 
 session_index_rebuild_fts
 sqlite3 "$SESSION_INDEX_DB" "INSERT INTO sessions_fts(sessions_fts) VALUES ('optimize');" 2>/dev/null
 
 _fts_count=$(sqlite3 "$SESSION_INDEX_DB" "SELECT COUNT(*) FROM sessions_fts;" 2>/dev/null || echo 0)
-ui_phase_done "Phase 5: FTS rebuild" "$_fts_count entries, $_syn_count synonyms" "$_p5_start"
+ui_phase_done "Phase 6: FTS rebuild" "$_fts_count entries, $_syn_count synonyms" "$_p6_start"
 
 # ─── Summary ──────────────────────────────────────────────
 

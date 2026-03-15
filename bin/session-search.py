@@ -12,6 +12,9 @@ Usage:
     session-search.py --context-inject CWD       # SessionStart context line
     session-search.py --stats                    # Index statistics
     session-search.py --limit N "query"          # Limit results (default 10)
+    session-search.py --explain "query"          # Show match explanation per result
+    session-search.py --analytics                # Show search log statistics
+    session-search.py --analytics --fails        # Show only zero-result queries
 """
 
 import argparse
@@ -19,8 +22,10 @@ import json
 import math
 import os
 import re
+import shutil
 import sqlite3
 import sys
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -318,6 +323,9 @@ class QueryPipeline:
         # Store original query tokens (pre-expansion) for NEAR matching
         self._original_tokens = [t for t in compound_tokens if t not in effective_stops][:6]
 
+        # Store final tokens for --explain
+        self._final_tokens = corrected
+
         # 6. Progressive search
         results = self._progressive_search(corrected, limit, project_filter, auto_date_range, min_messages)
 
@@ -327,6 +335,7 @@ class QueryPipeline:
             if llm_results:
                 # Merge via RRF
                 results = self._reciprocal_rank_fusion([results, llm_results])[:limit * 2]
+                self._last_strategy = getattr(self, '_last_strategy', 'none') + " + LLM expansion"
 
         # 7. Apply recency boost + depth multiplier and sort
         for r in results:
@@ -343,6 +352,14 @@ class QueryPipeline:
         # Build NEAR strategy from original (pre-expansion) tokens
         orig = getattr(self, '_original_tokens', tokens[:4])
 
+        strategy_names = [
+            "NEAR proximity",
+            "AND phrase",
+            "OR match",
+            "Core terms only",
+            "Prefix match",
+        ]
+
         strategies = [
             # 0. NEAR proximity match (original terms within 5 tokens of each other)
             lambda t: (f'NEAR({" ".join(orig)}, 5)' if len(orig) > 1 else None),
@@ -357,17 +374,21 @@ class QueryPipeline:
         ]
 
         best_results = []
-        for strategy in strategies:
+        best_strategy = None
+        for i, strategy in enumerate(strategies):
             fts_query = strategy(tokens)
             if not fts_query:
                 continue
             results = self._execute_query(fts_query, limit * 2, project_filter, date_range, min_messages)
             if results:
                 if len(results) >= 3:
+                    self._last_strategy = strategy_names[i]
                     return results  # Sufficient results, stop here
                 # Sparse results — keep but try broader strategies
                 if len(results) > len(best_results):
                     best_results = results
+                    best_strategy = strategy_names[i]
+        self._last_strategy = best_strategy or "none"
         return best_results
 
     def _execute_query(self, fts_query, limit, project_filter, date_range, min_messages=0):
@@ -608,6 +629,209 @@ class QueryPipeline:
         )
         conn.commit()
 
+    def _explain_match(self, result, tokens, raw_query):
+        """Explain why a result matched the query. Returns list of lines (no prefix)."""
+        color = _use_color()
+        R = "\033[0m" if color else ""
+        CYAN = "\033[36m" if color else ""
+        YELLOW = "\033[33m" if color else ""
+        DIM = "\033[2m" if color else ""
+
+        explanations = []
+
+        # Check which columns contain query terms — group by token
+        columns = {
+            'summary': result.get('summary', ''),
+            'first_prompt': result.get('first_prompt', ''),
+            'tags': result.get('tags', ''),
+            'keywords': result.get('keywords', ''),
+            'context_text': result.get('context_text', ''),
+            'assistant_text': result.get('assistant_hl', ''),
+            'files_changed': result.get('files_changed', ''),
+            'commands_run': result.get('commands_run', ''),
+        }
+
+        for token in tokens:
+            matching_cols = [col for col, text in columns.items() if text and token.lower() in text.lower()]
+            if matching_cols:
+                cols_str = f"{CYAN}{', '.join(matching_cols)}{R}"
+                explanations.append(f"'{token}' \u2192 {cols_str}")
+
+        # Combine BM25 + strategy on one line
+        parts = []
+        strategy = getattr(self, '_last_strategy', None)
+        if strategy:
+            parts.append(f"Strategy: {strategy}")
+        if 'bm25' in result:
+            parts.append(f"BM25: {YELLOW}{result['bm25']:.2f}{R}")
+        if parts:
+            joined = ' \u00b7 '.join(parts)
+            explanations.append(f"{DIM}{joined}{R}")
+
+        # Show synonym/verb expansions
+        effective_stops = STOP_WORDS - KEEP_WORDS
+        raw_tokens = re.findall(r'[a-z0-9][-a-z0-9_.]*[a-z0-9]|[a-z0-9]+', raw_query.lower())
+        raw_tokens = [t for t in raw_tokens if t not in effective_stops]
+        expanded_only = [t for t in tokens if t not in raw_tokens]
+        if expanded_only:
+            explanations.append(f"Expanded: {DIM}{', '.join(expanded_only[:10])}{R}")
+
+        return '\n'.join(explanations)
+
+    def reset_dedup(self):
+        """Reset description deduplication tracking for a new search."""
+        self._seen_descriptions = set()
+
+    def build_deduped_description(self, r):
+        """Build description with deduplication — if the same text was already
+        shown for a previous result, try alternative sources."""
+        if not hasattr(self, '_seen_descriptions'):
+            self._seen_descriptions = set()
+
+        desc = _build_description(r)
+        desc_hash = hash(desc[:200])
+
+        if desc_hash in self._seen_descriptions:
+            # Try alternative sources in priority order
+            alternatives = [
+                (r.get('summary') or '').strip(),
+                (r.get('assistant_hl') or '').strip()[:200],
+                (r.get('first_prompt') or '').strip()[:200],
+                (r.get('context_text') or '').strip()[:200],
+            ]
+            for alt in alternatives:
+                if alt and len(alt) >= 8 and hash(alt[:200]) not in self._seen_descriptions:
+                    desc = alt
+                    desc_hash = hash(desc[:200])
+                    break
+
+        self._seen_descriptions.add(desc_hash)
+        return desc
+
+    def _show_analytics(self, fails_only=False):
+        """Show search log statistics with box-drawing layout."""
+        conn = self._connect()
+        color = _use_color()
+        R = "\033[0m" if color else ""
+        BOLD = "\033[1m" if color else ""
+        DIM = "\033[2m" if color else ""
+        WHITE = "\033[38;5;255m" if color else ""
+        CYAN = "\033[36m" if color else ""
+        YELLOW = "\033[33m" if color else ""
+
+        H = "\u2500"  # ─
+        TL, TR, BL, BR = "\u256d", "\u256e", "\u2570", "\u256f"
+        V = "\u2502"  # │
+        ML, MR = "\u251c", "\u2524"  # ├ ┤
+
+        tw = _get_term_width()
+        bw = min(56, tw - 4)  # box width
+
+        # Total searches
+        total = conn.execute("SELECT COUNT(*) FROM search_log").fetchone()[0]
+
+        if total == 0:
+            print(f"\n  {DIM}No search history yet.{R}\n")
+            return
+
+        # Average latency
+        avg_latency = conn.execute("SELECT AVG(pipeline_ms) FROM search_log").fetchone()[0]
+
+        # Zero-result queries
+        zero_results = conn.execute(
+            "SELECT query, COUNT(*) as cnt FROM search_log WHERE result_count = 0 "
+            "GROUP BY query ORDER BY cnt DESC LIMIT 20"
+        ).fetchall()
+        zero_count = conn.execute(
+            "SELECT COUNT(*) FROM search_log WHERE result_count = 0"
+        ).fetchone()[0]
+        zero_pct = (zero_count / total * 100) if total else 0
+
+        if fails_only:
+            print()
+            print(f"  {BOLD}{WHITE}Zero-Result Queries{R}  {DIM}({len(zero_results)} unique){R}")
+            print(f"  {DIM}{H * bw}{R}")
+            for row in zero_results:
+                print(f"   {YELLOW}{row[1]:>3}\u00d7{R}  {row[0]}")
+            print()
+            return
+
+        # Top queries
+        top_queries = conn.execute(
+            "SELECT query, COUNT(*) as cnt, AVG(result_count) as avg_results "
+            "FROM search_log GROUP BY query ORDER BY cnt DESC LIMIT 15"
+        ).fetchall()
+
+        # Recent searches
+        recent = conn.execute(
+            "SELECT query, result_count, pipeline_ms, created_at "
+            "FROM search_log ORDER BY created_at DESC LIMIT 10"
+        ).fetchall()
+
+        # ─── Summary Box ─────────────────────────────────
+        title = "Search Analytics"
+        total_str = f"{total} searches"
+        inner = bw - 2
+        spacing = inner - len(title) - len(total_str)
+        print()
+        print(f"  {DIM}{TL}{H * bw}{TR}{R}")
+        print(f"  {DIM}{V}{R} {BOLD}{WHITE}{title}{R}{' ' * max(1, spacing)}{DIM}{total_str}{R} {DIM}{V}{R}")
+        print(f"  {DIM}{ML}{H * bw}{MR}{R}")
+
+        # Avg latency row
+        latency_label = "Avg latency"
+        latency_val = f"{avg_latency:.1f}ms"
+        lat_space = inner - len(latency_label) - len(latency_val)
+        print(f"  {DIM}{V}{R} {DIM}{latency_label}{R}{' ' * max(1, lat_space)}{CYAN}{latency_val}{R} {DIM}{V}{R}")
+
+        # Zero-result row
+        zr_label = "Zero-result"
+        zr_val = f"{zero_pct:.1f}% ({zero_count}/{total})"
+        zr_space = inner - len(zr_label) - len(zr_val)
+        zr_color = YELLOW if zero_pct > 10 else DIM
+        print(f"  {DIM}{V}{R} {DIM}{zr_label}{R}{' ' * max(1, zr_space)}{zr_color}{zr_val}{R} {DIM}{V}{R}")
+        print(f"  {DIM}{BL}{H * bw}{BR}{R}")
+
+        # ─── Top Queries ─────────────────────────────────
+        print()
+        print(f"  {BOLD}{WHITE}Top Queries{R}")
+        print(f"  {DIM}{H * bw}{R}")
+        for row in top_queries:
+            count_str = f"{row[1]:>3}\u00d7"
+            avg_str = f"avg {row[2]:>2.0f} results"
+            query_w = bw - len(count_str) - len(avg_str) - 4
+            query_display = row[0][:query_w].ljust(query_w)
+            print(f"   {YELLOW}{count_str}{R}  {query_display}  {DIM}{avg_str}{R}")
+
+        # ─── Failed Queries ──────────────────────────────
+        if zero_results:
+            print()
+            print(f"  {BOLD}{WHITE}Failed Queries{R}  {DIM}(tuning targets){R}")
+            print(f"  {DIM}{H * bw}{R}")
+            for row in zero_results[:10]:
+                print(f"   {YELLOW}{row[1]:>3}\u00d7{R}  {row[0]}")
+
+        # ─── Recent Searches ─────────────────────────────
+        print()
+        print(f"  {BOLD}{WHITE}Recent Searches{R}")
+        print(f"  {DIM}{H * bw}{R}")
+        for row in recent:
+            ts = row[3]
+            # Show just date portion for compactness
+            try:
+                dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+                ts_short = dt.strftime("%m/%d %H:%M")
+            except Exception:
+                ts_short = ts[:16]
+            res_str = f"{row[1]:>2} res"
+            ms_str = f"{row[2]:>.0f}ms"
+            meta = f"{res_str}  {ms_str}"
+            query_w = bw - len(ts_short) - len(meta) - 4
+            query_display = row[0][:query_w].ljust(query_w)
+            print(f"   {DIM}{ts_short}{R}  {query_display}{DIM}{meta}{R}")
+
+        print()
+
     def close(self):
         if self.conn:
             self.conn.close()
@@ -651,8 +875,10 @@ def format_relative_time(created_at, compact=False):
 
 
 def _use_color():
-    """Check if ANSI colors should be used. Always on unless explicitly disabled."""
-    return not os.environ.get("NO_COLOR") and os.environ.get("TERM") != "dumb"
+    """Check if ANSI colors should be used. Disabled for pipes or explicit NO_COLOR."""
+    return (sys.stdout.isatty()
+            and not os.environ.get("NO_COLOR")
+            and os.environ.get("TERM") != "dumb")
 
 
 def _smart_truncate(text, max_len):
@@ -805,44 +1031,70 @@ def _pad_visible(text, width, align='left'):
     return text + ' ' * pad
 
 
-def _render_highlights(text, bold_start="\033[1;33m", bold_end="\033[0m"):
-    """Convert \x02...\x03 FTS5 highlight markers to ANSI bold."""
+def _render_highlights(text, bold_start="\033[1;4;33m", bold_end="\033[0m"):
+    """Convert \\x02...\\x03 FTS5 highlight markers to ANSI bold+underline+yellow."""
     return text.replace("\x02", bold_start).replace("\x03", bold_end)
 
 
-def format_table(results, elapsed_ms=0, pipeline=None, raw_query=None):
-    if not results:
-        print("No results found.")
-        if pipeline and raw_query:
-            suggestions = pipeline.suggest_alternatives(raw_query)
-            if suggestions:
-                print()
-                print("  Try instead:")
-                for term, count in suggestions:
-                    print(f"    claude-search \"{term}\"  ({count} results)")
-        return
+def _get_term_width():
+    """Get terminal width, capped at 120. Fallback 80 for non-TTY."""
+    try:
+        tw = shutil.get_terminal_size().columns
+    except (AttributeError, ValueError, OSError):
+        tw = 80
+    return min(tw, 120)
 
+
+def _box_line(left, fill, right, width, dim="", reset=""):
+    """Build a box-drawing line: left + fill*width + right."""
+    return f"{dim}{left}{fill * width}{right}{reset}"
+
+
+def format_table(results, elapsed_ms=0, pipeline=None, raw_query=None, explain=False, tokens=None):
     color = _use_color()
     R = "\033[0m" if color else ""
     BOLD = "\033[1m" if color else ""
     DIM = "\033[2m" if color else ""
     GREEN = "\033[32m" if color else ""
     CYAN = "\033[36m" if color else ""
+    YELLOW = "\033[33m" if color else ""
     BLUE = "\033[38;5;33m" if color else ""
+    MAGENTA = "\033[35m" if color else ""
     DIM_MAGENTA = "\033[2;35m" if color else ""
     WHITE = "\033[38;5;255m" if color else ""
+    GRAY = "\033[90m" if color else ""
+    BOLD_CYAN = "\033[1;36m" if color else ""
 
-    H = "\u2500"  # ─
+    H = "\u2500"  # horizontal: ─
     TL, TR, BL, BR = "\u256d", "\u256e", "\u2570", "\u256f"  # ╭╮╰╯
     V = "\u2502"  # │
+    ML, MR = "\u251c", "\u2524"  # ├ ┤
+    THIN_V = "\u250a"  # thin vertical: ┊
 
-    # Terminal width (capped at 120 per deploy-status convention)
-    try:
-        tw = os.get_terminal_size().columns
-    except (AttributeError, ValueError, OSError):
-        tw = 80
-    tw = min(tw, 120)
+    tw = _get_term_width()
     cw = tw - 4  # content width (2 indent + 2 margin)
+
+    if not results:
+        # ─── Zero-Result Empty State ──────────────────────
+        display_query = raw_query or "query"
+        label = f'No results for "{display_query}"'
+        box_inner = max(len(label) + 4, 48)
+        print()
+        print(f"  {DIM}{TL}{H * box_inner}{TR}{R}")
+        print(f"  {DIM}{V}{R}  {YELLOW}{label}{R}{' ' * (box_inner - len(label) - 2)}{DIM}{V}{R}")
+        print(f"  {DIM}{BL}{H * box_inner}{BR}{R}")
+
+        if pipeline and raw_query:
+            suggestions = pipeline.suggest_alternatives(raw_query)
+            print()
+            print(f"  {DIM}Suggestions:{R}")
+            if suggestions:
+                for term, count in suggestions:
+                    print(f"    {GREEN}\u2192{R} Try: {BOLD}\"{term}\"{R}  {DIM}({count} results){R}")
+            print(f"    {GREEN}\u2192{R} Use {CYAN}@project{R} to filter by project")
+            print(f"    {GREEN}\u2192{R} Use {MAGENTA}#tag{R} to filter by tag")
+        print()
+        return
 
     # ─── Column Grid ──────────────────────────────────────
     # Fixed gutter: rank(2, right-aligned) + gap(2) = 4 chars
@@ -855,18 +1107,19 @@ def format_table(results, elapsed_ms=0, pipeline=None, raw_query=None):
     COL_MSGS = 9      # "  83 msgs", "2.4k msgs" — right-aligned number + " msgs"
     COL_SID  = 8      # "e6f2a0ee" — right-aligned at line end
     SEP_W    = 3      # " · " separator between columns (visible rhythm)
-    # Tags fill remaining: content - age - sep - msgs - sep - sid - sep
-    COL_TAGS = content - COL_AGE - SEP_W - COL_MSGS - SEP_W - COL_SID - SEP_W
+    # Tags fill remaining: content - age - sep - msgs - sep - sid
+    # Session ID is right-aligned to terminal edge (no trailing separator)
+    COL_TAGS = content - COL_AGE - SEP_W - COL_MSGS - SEP_W - COL_SID
 
     # ─── Header Card ──────────────────────────────────────
     title_text = "Session Search"
-    meta_text = f"{len(results)} results \u00b7 {elapsed_ms}ms"
+    meta_text = f"{len(results)} result{'s' if len(results) != 1 else ''} \u00b7 {elapsed_ms}ms"
     inner = cw - 2  # inside box padding
     spacing = inner - len(title_text) - len(meta_text)
     print()
-    print(f"  {DIM}{TL}{H * cw}{TR}{R}")
-    print(f"  {DIM}{V}{R} {BOLD}{title_text}{R}{' ' * max(1, spacing)}{DIM}{meta_text}{R} {DIM}{V}{R}")
-    print(f"  {DIM}{BL}{H * cw}{BR}{R}")
+    print(f"  {_box_line(TL, H, TR, cw, DIM, R)}")
+    print(f"  {DIM}{V}{R} {BOLD}{WHITE}{title_text}{R}{' ' * max(1, spacing)}{DIM}{meta_text}{R} {DIM}{V}{R}")
+    print(f"  {_box_line(BL, H, BR, cw, DIM, R)}")
 
     # ─── Result Rows ──────────────────────────────────────
     for i, r in enumerate(results, 1):
@@ -878,11 +1131,16 @@ def format_table(results, elapsed_ms=0, pipeline=None, raw_query=None):
         tags_raw = r.get("tags", "")
         branch = (r.get("git_branch") or "").strip()
 
-        # Build smart description (use highlighted summary if available)
-        desc_raw = _build_description(r)
-        # Apply FTS5 highlight markers for matched terms
+        # Build smart description with deduplication
+        if pipeline:
+            desc_raw = pipeline.build_deduped_description(r)
+        else:
+            desc_raw = _build_description(r)
+        # Check if FTS5 highlight markers are available (keep raw \x02/\x03 for now)
+        has_highlights = False
         if r.get("summary_hl") and "\x02" in r.get("summary_hl", ""):
-            desc_raw = _render_highlights(r["summary_hl"], f"{BOLD}{GREEN}", R)
+            desc_raw = r["summary_hl"]
+            has_highlights = True
 
         # Format message count (right-aligned number within COL_MSGS)
         if msgs >= 1000:
@@ -890,32 +1148,52 @@ def format_table(results, elapsed_ms=0, pipeline=None, raw_query=None):
         else:
             msgs_num = str(msgs)
 
-        # Wrap description into up to 5 lines
-        desc_lines = _wrap_lines(desc_raw, content, max_lines=5)
+        # Wrap description using raw markers (1 byte each, same visual width as nothing)
+        # Strip markers for wrapping, then re-apply after
+        desc_plain = desc_raw.replace("\x02", "").replace("\x03", "") if has_highlights else desc_raw
+        desc_lines = _wrap_lines(desc_plain, content, max_lines=5)
+
+        # Re-apply highlights to wrapped lines if present
+        if has_highlights and color:
+            HL_ON = "\033[1;4;33m"
+            HL_OFF = R
+            # Re-match highlight spans from original text onto wrapped lines
+            # Simple approach: apply highlights per-line by finding matching terms
+            highlighted_lines = []
+            for line in desc_lines:
+                # Find terms that were highlighted in summary_hl
+                hl_text = r["summary_hl"]
+                for m in re.finditer(r'\x02([^\x03]+)\x03', hl_text):
+                    term = m.group(1)
+                    # Case-insensitive replacement preserving case
+                    pattern = re.compile(re.escape(term), re.IGNORECASE)
+                    line = pattern.sub(f"{HL_ON}{term}{HL_OFF}", line)
+                highlighted_lines.append(line)
+            desc_lines = highlighted_lines
 
         # Rank gutter: right-aligned number in 2 chars + 2-space gap
         rank_str = f"{i:>2}"
 
-        # Line 1: rank + first description line (bold)
+        # Line 1: rank + first description line (bold white)
         print(f"  {BOLD}{CYAN}{rank_str}{R}  {BOLD}{WHITE}{desc_lines[0]}{R}")
 
-        # Lines 2-3: continuation (indented to content column)
+        # Lines 2+: continuation (indented to content column, dim for hierarchy)
         for line in desc_lines[1:]:
-            print(f"  {' ' * GUTTER}{line}")
+            print(f"  {' ' * GUTTER}{DIM}{line}{R}")
 
         # ─── Metadata (fixed-width columns) ───────────────
         # Age column (right-aligned in fixed width, dim)
         age_col = _pad_visible(f"{DIM}{age}{R}", COL_AGE, 'right')
 
-        # Msgs column (right-aligned number + " msgs", highlight if >= 100)
+        # Msgs column (right-aligned number + " msgs", bold cyan if >= 100)
         if msgs >= 100:
             msgs_col = _pad_visible(
-                f"{BOLD}{CYAN}{msgs_num}{R}{DIM} msgs{R}", COL_MSGS, 'right'
+                f"{BOLD_CYAN}{msgs_num}{R}{DIM} msgs{R}", COL_MSGS, 'right'
             )
         else:
             msgs_col = _pad_visible(f"{DIM}{msgs_num} msgs{R}", COL_MSGS, 'right')
 
-        # Tags column (left-aligned, truncated to fit, dim magenta)
+        # Tags column (left-aligned, truncated to fit, magenta for differentiation)
         if branch and branch not in ("main", "master"):
             tag_parts = branch
             if tags_raw:
@@ -923,32 +1201,41 @@ def format_table(results, elapsed_ms=0, pipeline=None, raw_query=None):
         else:
             tag_parts = tags_raw
         tags_display = _truncate_tags(tag_parts, COL_TAGS) if tag_parts else ""
-        if tags_display:
-            tags_col = _pad_visible(f"{DIM_MAGENTA}{tags_display}{R}", COL_TAGS)
-        else:
-            tags_col = ' ' * COL_TAGS
 
-        # Session ID column (right-aligned, blue)
-        sid_col = _pad_visible(f"{BLUE}{short_id}{R}", COL_SID, 'right')
+        # Session ID column (right-aligned to terminal edge, cyan for actionable)
+        sid_col = _pad_visible(f"{CYAN}{short_id}{R}", COL_SID, 'right')
 
-        # Dim · separators between columns for visual rhythm
+        # Build metadata line: age · msgs · tags (right-aligned sid at edge)
         sep = f" {DIM}\u00b7{R} "
         if tags_display:
-            print(f"  {' ' * GUTTER}{age_col}{sep}{msgs_col}{sep}{tags_col}{sep}{sid_col}")
+            tags_col = f"{MAGENTA}{tags_display}{R}"
+            # Calculate padding to right-align session ID to terminal edge
+            meta_left = f"{age_col}{sep}{msgs_col}{sep}{tags_col}"
+            meta_left_vis = _visible_len(meta_left)
+            sid_pad = content - meta_left_vis - COL_SID
+            print(f"  {' ' * GUTTER}{meta_left}{' ' * max(1, sid_pad)}{sid_col}")
         else:
-            # No tags: skip tag separators, keep session ID separator
-            spacer = ' ' * (SEP_W + COL_TAGS)
-            print(f"  {' ' * GUTTER}{age_col}{sep}{msgs_col}{spacer}{sep}{sid_col}")
+            meta_left = f"{age_col}{sep}{msgs_col}"
+            meta_left_vis = _visible_len(meta_left)
+            sid_pad = content - meta_left_vis - COL_SID
+            print(f"  {' ' * GUTTER}{meta_left}{' ' * max(1, sid_pad)}{sid_col}")
+
+        # Explain match (if --explain flag is active)
+        if explain and pipeline and raw_query and tokens:
+            explanation = pipeline._explain_match(r, tokens, raw_query)
+            if explanation:
+                for exp_line in explanation.split('\n'):
+                    print(f"  {' ' * GUTTER}{GRAY}{THIN_V}{R} {GRAY}{exp_line.strip()}{R}")
 
         # Separator (skip after last result)
         if i < len(results):
             print(f"  {DIM}{H * cw}{R}")
 
     # ─── Footer Card ──────────────────────────────────────
-    print(f"  {DIM}{TL}{H * cw}{TR}{R}")
+    print(f"  {_box_line(TL, H, TR, cw, DIM, R)}")
     footer_text = f"claude-search --resume N  \u00b7  --fzf for interactive"
     print(f"  {DIM}{V}{R} {GREEN}\u25cf{R}  {DIM}{footer_text}{R}{' ' * max(0, inner - len(footer_text) - 3)} {DIM}{V}{R}")
-    print(f"  {DIM}{BL}{H * cw}{BR}{R}")
+    print(f"  {_box_line(BL, H, BR, cw, DIM, R)}")
     print()
 
 
@@ -1109,6 +1396,9 @@ def main():
     parser.add_argument("--preview", metavar="SESSION_ID", help="Preview a session")
     parser.add_argument("--context-inject", metavar="CWD", help="Generate SessionStart context")
     parser.add_argument("--stats", action="store_true", help="Show index statistics")
+    parser.add_argument("--explain", action="store_true", help="Show match explanation for each result")
+    parser.add_argument("--analytics", action="store_true", help="Show search log analytics")
+    parser.add_argument("--fails", action="store_true", help="Show only zero-result queries (with --analytics)")
     args = parser.parse_args()
 
     if not DB_PATH.exists():
@@ -1120,18 +1410,54 @@ def main():
     try:
         if args.stats:
             s = pipeline.stats()
-            print(f"Total sessions: {s['total']}")
-            print(f"Tagged:         {s['tagged']}")
-            print(f"Projects:       {s['projects']}")
-            print(f"Last indexed:   {s['last_indexed']}")
+            color = _use_color()
+            R = "\033[0m" if color else ""
+            BOLD = "\033[1m" if color else ""
+            DIM = "\033[2m" if color else ""
+            WHITE = "\033[38;5;255m" if color else ""
+            CYAN = "\033[36m" if color else ""
+
+            _H = "\u2500"
+            _TL, _TR, _BL, _BR = "\u256d", "\u256e", "\u2570", "\u256f"
+            _V = "\u2502"
+            _ML, _MR = "\u251c", "\u2524"
+
+            bw = 52
+            inner = bw - 2
             print()
-            print("By source:")
+            print(f"  {DIM}{_TL}{_H * bw}{_TR}{R}")
+            title = "Session Index"
+            total_str = f"{s['total']} sessions"
+            sp = inner - len(title) - len(total_str)
+            print(f"  {DIM}{_V}{R} {BOLD}{WHITE}{title}{R}{' ' * max(1, sp)}{CYAN}{total_str}{R} {DIM}{_V}{R}")
+            print(f"  {DIM}{_ML}{_H * bw}{_MR}{R}")
+
+            rows = [
+                ("Tagged", str(s['tagged'])),
+                ("Projects", str(s['projects'])),
+                ("Last indexed", s['last_indexed'] or "never"),
+            ]
+            for label, val in rows:
+                sp = inner - len(label) - len(val)
+                print(f"  {DIM}{_V}{R} {DIM}{label}{R}{' ' * max(1, sp)}{val} {DIM}{_V}{R}")
+            print(f"  {DIM}{_BL}{_H * bw}{_BR}{R}")
+
+            print()
+            print(f"  {BOLD}{WHITE}By Source{R}")
+            print(f"  {DIM}{_H * bw}{R}")
             for src, cnt in s["by_source"]:
-                print(f"  {src:<20} {cnt}")
+                print(f"   {src:<20} {DIM}{cnt}{R}")
+
             print()
-            print("Top projects:")
+            print(f"  {BOLD}{WHITE}Top Projects{R}")
+            print(f"  {DIM}{_H * bw}{R}")
             for proj, cnt in s["by_project"]:
-                print(f"  {proj:<35} {cnt}")
+                print(f"   {proj:<35} {DIM}{cnt}{R}")
+            print()
+            return
+
+        if args.analytics:
+            pipeline._show_analytics(fails_only=args.fails)
             return
 
         if args.context_inject:
@@ -1179,7 +1505,12 @@ def main():
             parser.print_help()
             sys.exit(1)
 
-        import time
+        # Show spinner while searching (cosmetic — search is <5ms)
+        is_tty = sys.stdout.isatty()
+        if is_tty and args.format == "table":
+            sys.stdout.write('  \033[2m\u280b Searching\u2026\033[0m')
+            sys.stdout.flush()
+
         t0 = time.monotonic()
         results = pipeline.search(
             query,
@@ -1191,15 +1522,25 @@ def main():
         )
         elapsed_ms = int((time.monotonic() - t0) * 1000)
 
+        # Clear spinner
+        if is_tty and args.format == "table":
+            sys.stdout.write('\r\033[K')
+            sys.stdout.flush()
+
         pipeline.log_search(query, len(results), pipeline_ms=elapsed_ms)
         _cache_results(results)
+
+        # Reset dedup tracking before rendering
+        pipeline.reset_dedup()
 
         if args.format == "fzf":
             format_fzf(results)
         elif args.format == "json":
             format_json(results)
         else:
-            format_table(results, elapsed_ms, pipeline=pipeline, raw_query=query)
+            final_tokens = getattr(pipeline, '_final_tokens', [])
+            format_table(results, elapsed_ms, pipeline=pipeline, raw_query=query,
+                         explain=args.explain, tokens=final_tokens)
 
     finally:
         pipeline.close()

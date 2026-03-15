@@ -195,9 +195,40 @@ session_index_extract_keywords() {
     local text="$1"
     # Extract: kebab-case, dotted names, file extensions, underscored names
     # Note: grep -oE returns exit 1 on no match; || true prevents pipefail abort
-    echo "$text" | tr '[:upper:]' '[:lower:]' | \
+    local regex_keywords
+    regex_keywords=$(echo "$text" | tr '[:upper:]' '[:lower:]' | \
         (grep -oE '[a-z]+[-][a-z]+[-a-z]*|[a-z]+\.[a-z]+(\.[a-z]+)*|[a-z_]+\.(ts|tsx|js|jsx|py|sh|sql|json|md)|[a-z]+_[a-z_]+' || true) | \
-        sort -u | tr '\n' ' '
+        sort -u | tr '\n' ',' | sed 's/,$//')
+
+    # YAKE key phrase extraction (optional — silently skipped if not installed)
+    local yake_keywords
+    yake_keywords=$(python3 -c "
+import sys
+try:
+    import yake
+    extractor = yake.KeywordExtractor(top=10, stopwords='en', dedupLim=0.7)
+    text = sys.argv[1][:5000]
+    keyphrases = extractor.extract_keywords(text)
+    phrases = [kw[0].lower().replace(' ', '-') for kw in keyphrases if kw[1] < 0.1]
+    print(','.join(phrases))
+except ImportError:
+    pass
+except Exception:
+    pass
+" "$text" 2>/dev/null || true)
+
+    # Merge and deduplicate
+    local merged
+    if [ -n "$regex_keywords" ] && [ -n "$yake_keywords" ]; then
+        merged="$regex_keywords,$yake_keywords"
+    elif [ -n "$regex_keywords" ]; then
+        merged="$regex_keywords"
+    else
+        merged="$yake_keywords"
+    fi
+
+    # Deduplicate comma-separated list, output space-separated
+    echo "$merged" | tr ',' '\n' | sort -u | tr '\n' ' '
 }
 
 # ─── Project Name from Path ───────────────────────────────
@@ -302,46 +333,65 @@ session_index_extract_enriched() {
     local max_assistant_chars="${2:-3000}"
     local max_files="${3:-100}"
     [ -f "$transcript_path" ] || { printf '\t\t'; return; }
+
+    # Skip very large transcripts (>50MB) to prevent OOM
+    local file_size
+    file_size=$(stat -f%z "$transcript_path" 2>/dev/null || stat -c%s "$transcript_path" 2>/dev/null || echo 0)
+    if [ "$file_size" -gt 52428800 ]; then
+        session_index_log "Skipping large transcript ($file_size bytes): $transcript_path"
+        printf '\t\t'
+        return 0
+    fi
+
     python3 -c "
 import json, sys
-assistant_texts = []
-files = set()
-commands = []
-with open('$transcript_path') as f:
-    for line in f:
-        try:
-            obj = json.loads(line)
-            if obj.get('type') == 'assistant':
-                for block in obj.get('message', {}).get('content', []):
-                    if block.get('type') == 'text':
-                        text = block.get('text', '').strip()
-                        if len(text) > 30 and not text.startswith('<'):
-                            assistant_texts.append(text[:500])
-                    elif block.get('type') == 'tool_use':
-                        name = block.get('name', '')
-                        inp = block.get('input', {})
-                        if name in ('Read', 'Write', 'Edit'):
-                            fp = inp.get('file_path', '')
-                            if fp:
-                                files.add(fp)
-                        elif name in ('Glob', 'Grep'):
-                            path = inp.get('path', '')
-                            pattern = inp.get('pattern', '')
-                            if path: files.add(path)
-                            if pattern: files.add(pattern)
-                        elif name == 'Bash':
-                            cmd = inp.get('command', '')
-                            if cmd and len(cmd) < 500:
-                                commands.append(cmd)
-            elif obj.get('type') == 'file-history-snapshot':
-                backups = obj.get('snapshot', {}).get('trackedFileBackups', {})
-                files.update(backups.keys())
-        except:
-            pass
-at = ' '.join(assistant_texts)[:$max_assistant_chars].replace('\t', ' ').replace('\n', ' ').replace('\r', ' ')
-fc = ' '.join(sorted(files)[:$max_files]).replace('\t', ' ').replace('\n', ' ')
-cr = ' '.join(commands[:50]).replace('\t', ' ').replace('\n', ' ').replace('\r', ' ')
-sys.stdout.write(at + '\t' + fc + '\t' + cr)
+try:
+    assistant_texts = []
+    files = set()
+    commands = []
+    line_count = 0
+    max_lines = 10000
+    with open('$transcript_path') as f:
+        for line in f:
+            line_count += 1
+            if line_count > max_lines:
+                break
+            try:
+                obj = json.loads(line)
+                if obj.get('type') == 'assistant':
+                    for block in obj.get('message', {}).get('content', []):
+                        if block.get('type') == 'text':
+                            text = block.get('text', '').strip()
+                            if len(text) > 30 and not text.startswith('<'):
+                                assistant_texts.append(text[:500])
+                        elif block.get('type') == 'tool_use':
+                            name = block.get('name', '')
+                            inp = block.get('input', {})
+                            if name in ('Read', 'Write', 'Edit'):
+                                fp = inp.get('file_path', '')
+                                if fp:
+                                    files.add(fp)
+                            elif name in ('Glob', 'Grep'):
+                                path = inp.get('path', '')
+                                pattern = inp.get('pattern', '')
+                                if path: files.add(path)
+                                if pattern: files.add(pattern)
+                            elif name == 'Bash':
+                                cmd = inp.get('command', '')
+                                if cmd and len(cmd) < 500:
+                                    commands.append(cmd)
+                elif obj.get('type') == 'file-history-snapshot':
+                    backups = obj.get('snapshot', {}).get('trackedFileBackups', {})
+                    files.update(backups.keys())
+            except:
+                pass
+    at = ' '.join(assistant_texts)[:$max_assistant_chars].replace('\t', ' ').replace('\n', ' ').replace('\r', ' ')
+    fc = ' '.join(sorted(files)[:$max_files]).replace('\t', ' ').replace('\n', ' ')
+    cr = ' '.join(commands[:50]).replace('\t', ' ').replace('\n', ' ').replace('\r', ' ')
+    sys.stdout.write(at + '\t' + fc + '\t' + cr)
+except MemoryError:
+    sys.stdout.write('\t\t')
+    sys.exit(0)
 " 2>/dev/null || printf '\t\t'
 }
 

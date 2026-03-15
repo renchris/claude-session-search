@@ -680,8 +680,8 @@ def format_table(results, elapsed_ms=0):
         else:
             msgs_num = str(msgs)
 
-        # Wrap description into up to 3 lines
-        desc_lines = _wrap_lines(desc_raw, content, max_lines=3)
+        # Wrap description into up to 5 lines
+        desc_lines = _wrap_lines(desc_raw, content, max_lines=5)
 
         # Rank gutter: right-aligned number in 2 chars + 2-space gap
         rank_str = f"{i:>2}"
@@ -737,7 +737,7 @@ def format_table(results, elapsed_ms=0):
     # ─── Footer Card ──────────────────────────────────────
     print(f"  {DIM}{TL}{H * cw}{TR}{R}")
     footer_text = f"claude-search --resume N  \u00b7  --fzf for interactive"
-    print(f"  {DIM}{V}{R} {GREEN}\u25cf{R}  {DIM}{footer_text}{R}{' ' * max(0, inner - len(footer_text) - 4)} {DIM}{V}{R}")
+    print(f"  {DIM}{V}{R} {GREEN}\u25cf{R}  {DIM}{footer_text}{R}{' ' * max(0, inner - len(footer_text) - 3)} {DIM}{V}{R}")
     print(f"  {DIM}{BL}{H * cw}{BR}{R}")
     print()
 

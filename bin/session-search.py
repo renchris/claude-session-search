@@ -44,6 +44,10 @@ STOP_WORDS = {
 }
 # Keep domain-relevant words even if commonly stop-word-like
 KEEP_WORDS = {"not", "without", "no", "from", "after", "before", "during"}
+# Short function words that add noise when split from hyphenated compounds
+# e.g. "slide-out" → keep "slide", drop "out"; "check-in" → keep "check", drop "in"
+# These are already in STOP_WORDS or are noise only as hyphen fragments
+HYPHEN_FRAGMENT_STOPS = STOP_WORDS | {"out", "up", "off", "re", "pre", "non", "sub", "un", "co"}
 
 # ─── Verb Expansions ─────────────────────────────────────
 
@@ -310,9 +314,15 @@ class QueryPipeline:
         tokens = []
         for t in expanded:
             if "-" in t:
-                # Split and add both parts + keep as quoted phrase for adjacency match
                 parts = [p for p in t.split("-") if p]
-                tokens.extend(parts)
+                # Add a quoted adjacency phrase so FTS5 matches the compound term
+                # e.g. "slide-out" → "slide out" (phrase) + "slide" (individual)
+                if len(parts) >= 2:
+                    tokens.append(" ".join(parts))  # quoted phrase added later
+                # Add individual parts, but skip noise fragments (e.g. "out" from "slide-out")
+                for p in parts:
+                    if p not in HYPHEN_FRAGMENT_STOPS or len(parts) == 1:
+                        tokens.append(p)
             else:
                 tokens.append(t)
         tokens = list(dict.fromkeys(tokens))  # dedupe, preserve order
@@ -320,8 +330,23 @@ class QueryPipeline:
         # 5. Fuzzy correction (only for unknown terms)
         corrected = fuzzy_correct(tokens, known_terms)
 
-        # Store original query tokens (pre-expansion) for NEAR matching
-        self._original_tokens = [t for t in compound_tokens if t not in effective_stops][:6]
+        # Store original query tokens (pre-expansion) for NEAR matching.
+        # Split hyphens here too — FTS5 treats "-" as NOT operator in queries.
+        # Convert compound terms to quoted adjacency phrases (e.g. "slide-out" → '"slide out"')
+        near_tokens = []
+        for t in compound_tokens:
+            if t in effective_stops:
+                continue
+            if "-" in t:
+                parts = [p for p in t.split("-") if p]
+                if len(parts) >= 2:
+                    # Use quoted phrase so NEAR matches the compound as a unit
+                    near_tokens.append('"' + " ".join(parts) + '"')
+                elif parts:
+                    near_tokens.extend(parts)
+            else:
+                near_tokens.append(t)
+        self._original_tokens = near_tokens[:6]
 
         # Store final tokens for --explain
         self._final_tokens = corrected
@@ -363,8 +388,9 @@ class QueryPipeline:
         strategies = [
             # 0. NEAR proximity match (original terms within 5 tokens of each other)
             lambda t: (f'NEAR({" ".join(orig)}, 5)' if len(orig) > 1 else None),
-            # 1. Phrase match (AND)
-            lambda t: " AND ".join(f'"{tok}"' if " " in tok else tok for tok in t),
+            # 1. AND match on user's original terms only (not synonym expansions)
+            # orig tokens may be pre-quoted (e.g. '"slide out"') from hyphen compounds
+            lambda t: " AND ".join(tok if tok.startswith('"') else (f'"{tok}"' if " " in tok else tok) for tok in orig) if orig else None,
             # 2. OR match
             lambda t: build_fts5_query(t),
             # 3. Core terms only (drop expansions, keep first N originals)
@@ -401,7 +427,7 @@ class QueryPipeline:
             SELECT s.session_id, s.project_path, s.project_name, s.summary,
                    s.first_prompt, s.context_text, s.git_branch, s.created_at,
                    s.modified_at, s.message_count, s.tags, s.keywords, s.source,
-                   bm25(sessions_fts, 0.0, 10.0, 1.5, 5.0, 3.0, 0.5, 2.0, 3.0, 4.0, 2.0) AS bm25_score,
+                   bm25(sessions_fts, 0.0, 10.0, 1.5, 5.0, 3.0, 0.5, 2.0, 4.5, 2.5, 2.0) AS bm25_score,
                    highlight(sessions_fts, 1, '\x02', '\x03') AS summary_hl,
                    highlight(sessions_fts, 7, '\x02', '\x03') AS assistant_hl
             FROM sessions_fts
@@ -1156,18 +1182,22 @@ def format_table(results, elapsed_ms=0, pipeline=None, raw_query=None, explain=F
         # Re-apply highlights to wrapped lines if present
         if has_highlights and color:
             HL_ON = "\033[1;4;33m"
-            HL_OFF = R
+            # Context-aware restore: \033[0m (full reset) clobbers surrounding
+            # BOLD+WHITE on line 1 and DIM on continuation lines. Instead, reset
+            # highlight attrs (bold+underline+color) then re-apply the line style.
+            HL_OFF_BOLD_WHITE = "\033[22;24;39;1;97m"  # end hl attrs, restore bold+bright-white
+            HL_OFF_DIM = "\033[22;24;39;2m"            # end hl attrs, restore dim
             # Re-match highlight spans from original text onto wrapped lines
             # Simple approach: apply highlights per-line by finding matching terms
             highlighted_lines = []
-            for line in desc_lines:
-                # Find terms that were highlighted in summary_hl
-                hl_text = r["summary_hl"]
-                for m in re.finditer(r'\x02([^\x03]+)\x03', hl_text):
-                    term = m.group(1)
+            hl_text = r["summary_hl"]
+            hl_terms = list({m.group(1) for m in re.finditer(r'\x02([^\x03]+)\x03', hl_text)})
+            for line_idx, line in enumerate(desc_lines):
+                hl_off = HL_OFF_BOLD_WHITE if line_idx == 0 else HL_OFF_DIM
+                for term in hl_terms:
                     # Case-insensitive replacement preserving case
                     pattern = re.compile(re.escape(term), re.IGNORECASE)
-                    line = pattern.sub(f"{HL_ON}{term}{HL_OFF}", line)
+                    line = pattern.sub(f"{HL_ON}{term}{hl_off}", line)
                 highlighted_lines.append(line)
             desc_lines = highlighted_lines
 

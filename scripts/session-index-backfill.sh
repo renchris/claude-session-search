@@ -389,6 +389,7 @@ fi  # end --enrich-only skip
 _p4_start=$(_ui_now)
 phase4_enriched=0
 phase4_inserted=0
+phase4_skipped=0
 _p4_processed=0
 
 if [ "$_transcript_total" -eq 0 ]; then
@@ -409,6 +410,18 @@ else
             _p4_processed=$((_p4_processed + 1))
             ui_should_update "$_p4_processed" "$_transcript_total" && \
                 ui_phase_active "Phase 4: Transcript enrichment" "$_p4_processed" "$_transcript_total" "$_p4_start"
+
+            # Skip if already enriched (unless --enrich-only which means force re-enrich)
+            if [ "$ENRICH_ONLY" != "true" ]; then
+                _sid_check=$(echo "$sid" | sed "s/'/''/g")
+                already_enriched=$(sqlite3 "$SESSION_INDEX_DB" \
+                    "SELECT 1 FROM sessions WHERE session_id='$_sid_check' AND length(context_text) > 0 AND length(assistant_text) > 0 LIMIT 1;" \
+                    2>/dev/null || echo "")
+                if [ -n "$already_enriched" ]; then
+                    phase4_skipped=$((phase4_skipped + 1))
+                    continue
+                fi
+            fi
 
             # Extract context and message count from transcript
             context_text=$(session_index_extract_context "$transcript" 10)
@@ -466,7 +479,9 @@ SQL
         done
     done
 
-    ui_phase_done "Phase 4: Transcript enrichment" "$phase4_enriched enriched, $phase4_inserted new" "$_p4_start"
+    _p4_summary="$phase4_enriched enriched, $phase4_inserted new"
+    [ "$phase4_skipped" -gt 0 ] && _p4_summary="$_p4_summary, $phase4_skipped skipped"
+    ui_phase_done "Phase 4: Transcript enrichment" "$_p4_summary" "$_p4_start"
 fi
 
 # ─── Phase 5: Synonyms + FTS rebuild ──────────────────────

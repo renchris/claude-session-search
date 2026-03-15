@@ -8,6 +8,16 @@ SESSION_INDEX_LOG="$HOME/.claude/logs/session-index.log"
 CLAUDE_PROJECTS_DIR="$HOME/.claude/projects"
 CLAUDE_HISTORY="$HOME/.claude/history.jsonl"
 
+# Resolve repo root (follows symlink if helpers are symlinked from ~/.claude/hooks/)
+_helpers_real=$(readlink "${BASH_SOURCE[0]}" 2>/dev/null || echo "${BASH_SOURCE[0]}")
+if [[ "$_helpers_real" == /* ]]; then
+    SESSION_SEARCH_REPO="$(cd "$(dirname "$(dirname "$(dirname "$_helpers_real")")")" && pwd)"
+else
+    SESSION_SEARCH_REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+fi
+SESSION_SEARCH_PYTHON_DEPS="$SESSION_SEARCH_REPO/.python-deps"
+export SESSION_SEARCH_PYTHON_DEPS
+
 # ─── Logging ───────────────────────────────────────────────
 
 session_index_log() {
@@ -203,7 +213,10 @@ session_index_extract_keywords() {
     # YAKE key phrase extraction (optional — silently skipped if not installed)
     local yake_keywords
     yake_keywords=$(python3 -c "
-import sys
+import sys, os
+deps = os.environ.get('SESSION_SEARCH_PYTHON_DEPS', '')
+if deps and os.path.isdir(deps):
+    sys.path.insert(0, deps)
 try:
     import yake
     extractor = yake.KeywordExtractor(top=10, stopwords='en', dedupLim=0.7)

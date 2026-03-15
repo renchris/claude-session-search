@@ -458,24 +458,25 @@ def _smart_truncate(text, max_len):
     return truncated + "\u2026"
 
 
-def _wrap_two_lines(text, width):
-    """Word-wrap text into up to 2 lines. Returns (line1, line2_or_None)."""
-    text = text.replace("\n", " ").strip()
-    if len(text) <= width:
-        return text, None
-    # Find break point at word boundary near width
-    break_at = text[:width].rfind(" ")
-    if break_at <= 0:
-        break_at = width
-    line1 = text[:break_at].rstrip()
-    remainder = text[break_at:].strip()
-    if not remainder:
-        return line1, None
-    if len(remainder) <= width:
-        line2 = remainder
-    else:
-        line2 = remainder[:width - 1].rsplit(" ", 1)[0] + "\u2026"
-    return line1, line2
+def _wrap_lines(text, width, max_lines=3):
+    """Word-wrap text into up to max_lines lines. Returns list of strings."""
+    text = " ".join(text.replace("\n", " ").split()).strip()
+    lines = []
+    while text and len(lines) < max_lines:
+        if len(text) <= width:
+            lines.append(text)
+            break
+        break_at = text[:width].rfind(" ")
+        if break_at <= 0:
+            break_at = width
+        lines.append(text[:break_at].rstrip())
+        text = text[break_at:].strip()
+    # If text remains after max_lines, truncate last line
+    if text and lines:
+        last = lines[-1]
+        if len(last) + len(text) + 1 > width:
+            lines[-1] = _smart_truncate(last + " " + text, width)
+    return lines if lines else ["(no summary)"]
 
 
 def _truncate_tags(tags_str, max_len):
@@ -569,12 +570,11 @@ def format_table(results, elapsed_ms=0):
     # ─── Result Rows ─────────────────────────────────────
     # Color hierarchy: summary = default (primary), everything else = dim
     # Layout per result:
-    #   Line 1: #  age  msgs  [summary line 1]
-    #   Line 2:               [summary line 2]        short-id  (right-aligned to edge)
-    #   Line 3 (if tags):     tags
-    line_width = cw - indent  # chars available for summary/tags/id after indent
-    id_len = 8  # short ID length
-    s2_budget = line_width - id_len - 2  # line 2 text budget (reserve gap + ID)
+    #   Line 1:     #  age  msgs  [summary line 1, full width]
+    #   Line 2+:                  [summary continuation, full width]
+    #   Last line:                tags (left)  short-id (right)
+    line_width = cw - indent
+    id_len = 8
 
     for i, r in enumerate(results, 1):
         age = format_relative_time(r["created_at"])
@@ -583,7 +583,7 @@ def format_table(results, elapsed_ms=0):
         is_legacy = sid.startswith("legacy-")
         short_id = "*" if is_legacy else sid[:id_len]
         summary_raw = r["summary"] or r["first_prompt"] or "(no summary)"
-        tags_str = _truncate_tags(r.get("tags", ""), line_width)
+        tags_str = _truncate_tags(r.get("tags", ""), line_width - id_len - 2)
 
         # Msgs: dim for most, bold only for 100+
         msgs_str = str(msgs)
@@ -592,25 +592,23 @@ def format_table(results, elapsed_ms=0):
         else:
             msg_styled = f"{DIM}{msgs_str:>{COL_MSGS - 1}}{R} "
 
-        # Wrap summary: line 1 gets full width, line 2 reserves space for ID
-        s1, s2 = _wrap_two_lines(summary_raw, line_width)
-        if s2 and len(s2) > s2_budget:
-            s2 = _smart_truncate(s2, s2_budget)
+        # Word-wrap summary to 3 lines, full width on every line
+        lines = _wrap_lines(summary_raw, line_width, max_lines=3)
 
         # Line 1: #  age  msgs  summary-start
-        print(f"  {i:<{COL_NUM}}{DIM}{age:<{COL_AGE}}{R}{msg_styled}{s1}")
+        print(f"  {i:<{COL_NUM}}{DIM}{age:<{COL_AGE}}{R}{msg_styled}{lines[0]}")
 
-        # Line 2: summary continuation + short ID (always right-aligned to edge)
-        if s2:
-            pad = line_width - len(s2) - len(short_id)
-            print(f"  {' ' * indent}{s2}{' ' * max(2, pad)}{GRAY}{short_id}{R}")
+        # Lines 2-3: summary continuation (full width, no ID interference)
+        for line in lines[1:]:
+            print(f"  {' ' * indent}{line}")
+
+        # Final line: tags (left) + short ID (right-aligned)
+        if tags_str:
+            pad = line_width - len(tags_str) - len(short_id)
+            print(f"  {' ' * indent}{DIM}{tags_str}{R}{' ' * max(2, pad)}{GRAY}{short_id}{R}")
         else:
             pad = line_width - len(short_id)
             print(f"  {' ' * indent}{' ' * pad}{GRAY}{short_id}{R}")
-
-        # Line 3: tags (only if present)
-        if tags_str:
-            print(f"  {' ' * indent}{DIM}{tags_str}{R}")
 
     # ─── Footer Card ──────────────────────────────────────
     print()

@@ -647,9 +647,9 @@ def format_table(results, elapsed_ms=0):
     COL_AGE  = 4      # "2d", "1w", "12mo" — right-aligned
     COL_MSGS = 9      # "  83 msgs", "2.4k msgs" — right-aligned number + " msgs"
     COL_SID  = 8      # "e6f2a0ee" — right-aligned at line end
-    GAP      = 2      # space between columns
-    # Tags fill remaining: content - age - gap - msgs - gap - sid - gap
-    COL_TAGS = content - COL_AGE - GAP - COL_MSGS - GAP - COL_SID - GAP
+    SEP_W    = 3      # " · " separator between columns (visible rhythm)
+    # Tags fill remaining: content - age - sep - msgs - sep - sid - sep
+    COL_TAGS = content - COL_AGE - SEP_W - COL_MSGS - SEP_W - COL_SID - SEP_W
 
     # ─── Header Card ──────────────────────────────────────
     title_text = "Session Search"
@@ -721,7 +721,14 @@ def format_table(results, elapsed_ms=0):
         # Session ID column (right-aligned, blue)
         sid_col = _pad_visible(f"{BLUE}{short_id}{R}", COL_SID, 'right')
 
-        print(f"  {' ' * GUTTER}{age_col}{' ' * GAP}{msgs_col}{' ' * GAP}{tags_col}{' ' * GAP}{sid_col}")
+        # Dim · separators between columns for visual rhythm
+        sep = f" {DIM}\u00b7{R} "
+        if tags_display:
+            print(f"  {' ' * GUTTER}{age_col}{sep}{msgs_col}{sep}{tags_col}{sep}{sid_col}")
+        else:
+            # No tags: skip tag separators, keep session ID separator
+            spacer = ' ' * (SEP_W + COL_TAGS)
+            print(f"  {' ' * GUTTER}{age_col}{sep}{msgs_col}{spacer}{sep}{sid_col}")
 
         # Separator (skip after last result)
         if i < len(results):

@@ -595,12 +595,18 @@ def _build_description(r):
     return "(no description)"
 
 
-def _pad_visible(text, width):
+def _visible_len(text):
+    """Return visible length of text, stripping ANSI escape codes."""
+    return len(re.sub(r'\033\[[0-9;]*m', '', text))
+
+
+def _pad_visible(text, width, align='left'):
     """Pad text to fixed visible width, accounting for ANSI escape codes."""
-    visible = re.sub(r'\033\[[0-9;]*m', '', text)
-    pad = width - len(visible)
+    pad = width - _visible_len(text)
     if pad <= 0:
         return text
+    if align == 'right':
+        return ' ' * pad + text
     return text + ' ' * pad
 
 
@@ -630,7 +636,20 @@ def format_table(results, elapsed_ms=0):
         tw = 80
     tw = min(tw, 120)
     cw = tw - 4  # content width (2 indent + 2 margin)
-    desc_width = cw - 6  # indent for description lines (6 = "      ")
+
+    # ─── Column Grid ──────────────────────────────────────
+    # Fixed gutter: rank(2, right-aligned) + gap(2) = 4 chars
+    # Content area: cw - 4 = description and metadata width
+    GUTTER = 4        # rank + gap
+    content = cw - GUTTER  # available for description/metadata
+
+    # Metadata fixed columns (within content area, indented by GUTTER)
+    COL_AGE  = 4      # "2d", "1w", "12mo" — right-aligned
+    COL_MSGS = 9      # "  83 msgs", "2.4k msgs" — right-aligned number + " msgs"
+    COL_SID  = 8      # "e6f2a0ee" — right-aligned at line end
+    GAP      = 2      # space between columns
+    # Tags fill remaining: content - age - gap - msgs - gap - sid - gap
+    COL_TAGS = content - COL_AGE - GAP - COL_MSGS - GAP - COL_SID - GAP
 
     # ─── Header Card ──────────────────────────────────────
     title_text = "Session Search"
@@ -642,56 +661,67 @@ def format_table(results, elapsed_ms=0):
     print(f"  {DIM}{V}{R} {BOLD}{title_text}{R}{' ' * max(1, spacing)}{DIM}{meta_text}{R} {DIM}{V}{R}")
     print(f"  {DIM}{BL}{H * cw}{BR}{R}")
 
-    # ─── Result Cards ─────────────────────────────────────
-    # Each result is a fixed-height block:
-    #   Line 1: rank + summary title (bold white) — the primary scan target
-    #   Line 2: description continuation (if multi-line)
-    #   Line 3: description continuation (if multi-line)
-    #   Line 4: metadata — age · msgs · tags · session_id
-    #   Line 5: separator
+    # ─── Result Rows ──────────────────────────────────────
     for i, r in enumerate(results, 1):
         age = format_relative_time(r["created_at"], compact=True)
         msgs = r["message_count"]
         sid = r["session_id"]
         is_legacy = sid.startswith("legacy-")
         short_id = "*" if is_legacy else sid[:8]
-        tags_str = _truncate_tags(r.get("tags", ""), 40)
+        tags_raw = r.get("tags", "")
         branch = (r.get("git_branch") or "").strip()
 
         # Build smart description
         desc_raw = _build_description(r)
 
-        # Format message count
+        # Format message count (right-aligned number within COL_MSGS)
         if msgs >= 1000:
-            msgs_display = f"{msgs / 1000:.1f}k"
+            msgs_num = f"{msgs / 1000:.1f}k"
         else:
-            msgs_display = str(msgs)
+            msgs_num = str(msgs)
 
         # Wrap description into up to 3 lines
-        rank_prefix = f"{i:>2}  "  # "  1  " = 4 chars
-        first_line_width = cw - len(rank_prefix)
-        desc_lines = _wrap_lines(desc_raw, first_line_width, max_lines=3)
+        desc_lines = _wrap_lines(desc_raw, content, max_lines=3)
 
-        # Line 1: rank + first line of description (bold white = primary content)
-        print(f"  {BOLD}{WHITE}{rank_prefix}{desc_lines[0]}{R}")
+        # Rank gutter: right-aligned number in 2 chars + 2-space gap
+        rank_str = f"{i:>2}"
 
-        # Lines 2-3: continuation lines (same weight, indented to align)
+        # Line 1: rank + first description line (bold)
+        print(f"  {BOLD}{CYAN}{rank_str}{R}  {BOLD}{WHITE}{desc_lines[0]}{R}")
+
+        # Lines 2-3: continuation (indented to content column)
         for line in desc_lines[1:]:
-            print(f"  {'':4}{line}")
+            print(f"  {' ' * GUTTER}{line}")
 
-        # Metadata line: age · msgs · tags · session_id
-        # Build as a single string with explicit color control
-        meta = f"{DIM}{age}"
+        # ─── Metadata (fixed-width columns) ───────────────
+        # Age column (right-aligned in fixed width, dim)
+        age_col = _pad_visible(f"{DIM}{age}{R}", COL_AGE, 'right')
+
+        # Msgs column (right-aligned number + " msgs", highlight if >= 100)
         if msgs >= 100:
-            meta += f" \u00b7 {R}{BOLD}{CYAN}{msgs_display}{R}{DIM} msgs"
+            msgs_col = _pad_visible(
+                f"{BOLD}{CYAN}{msgs_num}{R}{DIM} msgs{R}", COL_MSGS, 'right'
+            )
         else:
-            meta += f" \u00b7 {msgs_display} msgs"
-        if tags_str:
-            meta += f" \u00b7 {R}{DIM_MAGENTA}{tags_str}{R}{DIM}"
+            msgs_col = _pad_visible(f"{DIM}{msgs_num} msgs{R}", COL_MSGS, 'right')
+
+        # Tags column (left-aligned, truncated to fit, dim magenta)
         if branch and branch not in ("main", "master"):
-            meta += f" \u00b7 {branch}"
-        meta += f" \u00b7 {R}{BLUE}{short_id}{R}"
-        print(f"      {meta}")
+            tag_parts = branch
+            if tags_raw:
+                tag_parts += f", {tags_raw}"
+        else:
+            tag_parts = tags_raw
+        tags_display = _truncate_tags(tag_parts, COL_TAGS) if tag_parts else ""
+        if tags_display:
+            tags_col = _pad_visible(f"{DIM_MAGENTA}{tags_display}{R}", COL_TAGS)
+        else:
+            tags_col = ' ' * COL_TAGS
+
+        # Session ID column (right-aligned, blue)
+        sid_col = _pad_visible(f"{BLUE}{short_id}{R}", COL_SID, 'right')
+
+        print(f"  {' ' * GUTTER}{age_col}{' ' * GAP}{msgs_col}{' ' * GAP}{tags_col}{' ' * GAP}{sid_col}")
 
         # Separator (skip after last result)
         if i < len(results):

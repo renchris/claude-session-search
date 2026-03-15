@@ -833,13 +833,13 @@ def format_preview(session):
         tags_display = ", ".join(t.strip() for t in session['tags'].split(',')[:5])
         print(f"\033[2;35m{tags_display}\033[0m")
 
-    # ─── Description (3 lines max, wrapped) ──────────────
+    # ─── Description (no pre-wrapping — let fzf handle it) ─
     desc = _build_description(session)
     if desc and desc != "(no description)":
         print()
         print(f"\033[1;33mAbout\033[0m:")
-        for line in _wrap_lines(desc, 76, max_lines=3):
-            print(f"  {line}")
+        # Print full description up to 800 chars, fzf wraps to pane width
+        print(f"  {desc[:800]}")
 
     # ─── Conversation Timeline (from transcript) ─────────
     last_msgs = _extract_last_messages(
@@ -849,11 +849,10 @@ def format_preview(session):
         print()
         print(f"\033[1;35mRecent Messages\033[0m:")
         for i, msg in enumerate(last_msgs, 1):
-            clean = " ".join(msg.split())
-            clean = _smart_truncate(clean, 120)
+            clean = " ".join(msg.split())[:250]
             print(f"  \033[2m{i}.\033[0m {clean}")
     elif session.get("first_prompt"):
-        fp = " ".join(session["first_prompt"].split())[:200]
+        fp = " ".join(session["first_prompt"].split())[:250]
         if len(fp) > 10:
             print()
             print(f"\033[1;35mFirst Message\033[0m:")

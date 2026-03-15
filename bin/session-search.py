@@ -547,6 +547,8 @@ def format_table(results, elapsed_ms=0):
     print(f"  {DIM}{H * cw}{R}")
 
     # ─── Result Rows (dense — no blank lines) ─────────────
+    # Color hierarchy: summary = default (primary), everything else = dim (secondary)
+    # Only row # gets weight (it's actionable for --resume N)
     for i, r in enumerate(results, 1):
         age = format_relative_time(r["created_at"])
         msgs = r["message_count"]
@@ -555,31 +557,25 @@ def format_table(results, elapsed_ms=0):
         short_id = "*" if is_legacy else sid[:8]
         tags_str = _truncate_tags(r.get("tags", ""), summary_no_id - COL_ID - 2)
 
-        # Message count: right-aligned in column
+        # Msgs: dim for most, bold only for 100+
         msgs_str = str(msgs)
-        if msgs >= 50:
-            msg_styled = f"{BOLD_YELLOW}{msgs_str:>{COL_MSGS - 1}}{R} "
-        elif msgs >= 20:
+        if msgs >= 100:
             msg_styled = f"{BOLD}{msgs_str:>{COL_MSGS - 1}}{R} "
-        elif msgs <= 2:
-            msg_styled = f"{DIM}{msgs_str:>{COL_MSGS - 1}}{R} "
         else:
-            msg_styled = f"{msgs_str:>{COL_MSGS - 1}} "
+            msg_styled = f"{DIM}{msgs_str:>{COL_MSGS - 1}}{R} "
 
         if tags_str:
-            # Has tags → summary on line 1, tags + ID on line 2
             summary = _smart_truncate(r["summary"] or r["first_prompt"] or "(no summary)", summary_no_id)
-            print(f"  {DIM}{i:<{COL_NUM}}{R}{YELLOW}{age:<{COL_AGE}}{R}{msg_styled}{summary}")
+            print(f"  {i:<{COL_NUM}}{DIM}{age:<{COL_AGE}}{R}{msg_styled}{summary}")
             line2_width = cw - indent
             gap = line2_width - len(tags_str) - len(short_id)
-            print(f"  {' ' * indent}{CYAN}{tags_str}{R}{' ' * max(2, gap)}{GRAY}{short_id}{R}")
+            print(f"  {' ' * indent}{DIM}{tags_str}{R}{' ' * max(2, gap)}{GRAY}{short_id}{R}")
         else:
-            # No tags → summary + ID on line 1 (no lonely line 2)
             id_budget = 2 + len(short_id)
             summary = _smart_truncate(r["summary"] or r["first_prompt"] or "(no summary)", summary_with_id - id_budget)
             vis_summary_len = len(summary)
             gap = summary_with_id - vis_summary_len - len(short_id)
-            print(f"  {DIM}{i:<{COL_NUM}}{R}{YELLOW}{age:<{COL_AGE}}{R}{msg_styled}{summary}{' ' * max(2, gap)}{GRAY}{short_id}{R}")
+            print(f"  {i:<{COL_NUM}}{DIM}{age:<{COL_AGE}}{R}{msg_styled}{summary}{' ' * max(2, gap)}{GRAY}{short_id}{R}")
 
     # ─── Footer Card ──────────────────────────────────────
     print()

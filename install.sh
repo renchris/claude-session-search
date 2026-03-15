@@ -144,9 +144,11 @@ symlink_file "$REPO_DIR/hooks/session-index-start.sh" "$HOOKS_DIR/session-index-
 symlink_file "$REPO_DIR/hooks/lib/session-index-helpers.sh" "$HOOKS_LIB/session-index-helpers.sh"
 symlink_file "$REPO_DIR/bin/session-search.py" "$BIN_DIR/session-search.py"
 symlink_file "$REPO_DIR/bin/claude-search" "$BIN_DIR/claude-search"
+symlink_file "$REPO_DIR/scripts/session-index-tag.py" "$BIN_DIR/session-index-tag.py"
 
 chmod +x "$HOOKS_DIR/session-index-end.sh" "$HOOKS_DIR/session-index-start.sh" \
-         "$BIN_DIR/claude-search" "$BIN_DIR/session-search.py"
+         "$BIN_DIR/claude-search" "$BIN_DIR/session-search.py" \
+         "$REPO_DIR/scripts/session-index-tag.py"
 
 inst_step_replace "Symlinks" "hooks + bin linked"
 
@@ -202,7 +204,7 @@ inst_step_active "Indexing" "scanning sessions..."
 "$REPO_DIR/scripts/session-index-backfill.sh" --quiet
 
 # Tag with regex (fast, no API needed)
-"$REPO_DIR/scripts/session-index-tag.sh" --regex-only --limit 1000 > /dev/null 2>&1 || true
+python3 "$REPO_DIR/scripts/session-index-tag.py" --regex-only --limit 1000 --quiet 2>/dev/null || true
 
 # Rebuild FTS with tags
 sqlite3 "$CLAUDE_DIR/session-index.db" "DELETE FROM sessions_fts; INSERT INTO sessions_fts (session_id, summary, first_prompt, tags, keywords, project_name, context_text, assistant_text, files_changed, commands_run) SELECT session_id, summary, first_prompt, tags, keywords, project_name, context_text, assistant_text, files_changed, commands_run FROM sessions;" 2>/dev/null || true

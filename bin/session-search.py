@@ -458,6 +458,26 @@ def _smart_truncate(text, max_len):
     return truncated + "\u2026"
 
 
+def _wrap_two_lines(text, width):
+    """Word-wrap text into up to 2 lines. Returns (line1, line2_or_None)."""
+    text = text.replace("\n", " ").strip()
+    if len(text) <= width:
+        return text, None
+    # Find break point at word boundary near width
+    break_at = text[:width].rfind(" ")
+    if break_at <= 0:
+        break_at = width
+    line1 = text[:break_at].rstrip()
+    remainder = text[break_at:].strip()
+    if not remainder:
+        return line1, None
+    if len(remainder) <= width:
+        line2 = remainder
+    else:
+        line2 = remainder[:width - 1].rsplit(" ", 1)[0] + "\u2026"
+    return line1, line2
+
+
 def _truncate_tags(tags_str, max_len):
     """Truncate tags at complete tag boundaries with +N overflow."""
     if not tags_str:
@@ -546,16 +566,21 @@ def format_table(results, elapsed_ms=0):
     print(f"  {BOLD}Results{R}  {DIM}{len(results)} sessions{R}")
     print(f"  {DIM}{H * cw}{R}")
 
-    # ─── Result Rows (dense — no blank lines) ─────────────
-    # Color hierarchy: summary = default (primary), everything else = dim (secondary)
-    # Only row # gets weight (it's actionable for --resume N)
+    # ─── Result Rows ─────────────────────────────────────
+    # Color hierarchy: summary = default (primary), everything else = dim
+    # Layout per result:
+    #   Line 1: #  age  msgs  [summary line 1]
+    #   Line 2:               [summary line 2]        short-id
+    #   Line 3 (if tags):     tags
     for i, r in enumerate(results, 1):
         age = format_relative_time(r["created_at"])
         msgs = r["message_count"]
         sid = r["session_id"]
         is_legacy = sid.startswith("legacy-")
         short_id = "*" if is_legacy else sid[:8]
-        tags_str = _truncate_tags(r.get("tags", ""), summary_no_id - COL_ID - 2)
+        summary_raw = r["summary"] or r["first_prompt"] or "(no summary)"
+        summary_budget = cw - indent
+        tags_str = _truncate_tags(r.get("tags", ""), summary_budget - COL_ID)
 
         # Msgs: dim for most, bold only for 100+
         msgs_str = str(msgs)
@@ -564,18 +589,23 @@ def format_table(results, elapsed_ms=0):
         else:
             msg_styled = f"{DIM}{msgs_str:>{COL_MSGS - 1}}{R} "
 
-        if tags_str:
-            summary = _smart_truncate(r["summary"] or r["first_prompt"] or "(no summary)", summary_no_id)
-            print(f"  {i:<{COL_NUM}}{DIM}{age:<{COL_AGE}}{R}{msg_styled}{summary}")
-            line2_width = cw - indent
-            gap = line2_width - len(tags_str) - len(short_id)
-            print(f"  {' ' * indent}{DIM}{tags_str}{R}{' ' * max(2, gap)}{GRAY}{short_id}{R}")
+        # Wrap summary to 2 lines
+        s1, s2 = _wrap_two_lines(summary_raw, summary_budget)
+
+        # Line 1: #  age  msgs  summary-start
+        print(f"  {i:<{COL_NUM}}{DIM}{age:<{COL_AGE}}{R}{msg_styled}{s1}")
+
+        # Line 2: summary continuation (or empty) + short ID right-aligned
+        if s2:
+            gap = summary_budget - len(s2) - len(short_id)
+            print(f"  {' ' * indent}{s2}{' ' * max(2, gap)}{GRAY}{short_id}{R}")
         else:
-            id_budget = 2 + len(short_id)
-            summary = _smart_truncate(r["summary"] or r["first_prompt"] or "(no summary)", summary_with_id - id_budget)
-            vis_summary_len = len(summary)
-            gap = summary_with_id - vis_summary_len - len(short_id)
-            print(f"  {i:<{COL_NUM}}{DIM}{age:<{COL_AGE}}{R}{msg_styled}{summary}{' ' * max(2, gap)}{GRAY}{short_id}{R}")
+            gap = summary_budget - len(short_id)
+            print(f"  {' ' * indent}{' ' * max(0, gap)}{GRAY}{short_id}{R}")
+
+        # Line 3: tags (only if present)
+        if tags_str:
+            print(f"  {' ' * indent}{DIM}{tags_str}{R}")
 
     # ─── Footer Card ──────────────────────────────────────
     print()

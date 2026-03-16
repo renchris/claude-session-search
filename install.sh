@@ -113,10 +113,11 @@ inst_step_pending "Symlinks"
 inst_step_pending "Settings"
 inst_step_pending "Indexing"
 inst_step_pending "PATH"
+inst_step_pending "Scheduler"
 
-# Move cursor back up 4 lines to overwrite steps in-place
+# Move cursor back up 5 lines to overwrite steps in-place
 if $_UI_IS_TTY; then
-    printf "\033[4A"
+    printf "\033[5A"
 fi
 
 # ─── Step 1: Symlinks ───────────────────────────────────────
@@ -145,10 +146,12 @@ symlink_file "$REPO_DIR/hooks/lib/session-index-helpers.sh" "$HOOKS_LIB/session-
 symlink_file "$REPO_DIR/bin/session-search.py" "$BIN_DIR/session-search.py"
 symlink_file "$REPO_DIR/bin/claude-search" "$BIN_DIR/claude-search"
 symlink_file "$REPO_DIR/scripts/session-index-tag.py" "$BIN_DIR/session-index-tag.py"
+symlink_file "$REPO_DIR/scripts/session-index-backfill.sh" "$BIN_DIR/session-index-backfill.sh"
 
 chmod +x "$HOOKS_DIR/session-index-end.sh" "$HOOKS_DIR/session-index-start.sh" \
          "$BIN_DIR/claude-search" "$BIN_DIR/session-search.py" \
-         "$REPO_DIR/scripts/session-index-tag.py"
+         "$REPO_DIR/scripts/session-index-tag.py" \
+         "$REPO_DIR/scripts/session-index-backfill.sh"
 
 inst_step_replace "Symlinks" "hooks + bin linked"
 
@@ -231,6 +234,23 @@ else
 fi
 
 inst_step_replace "PATH" "$PATH_DETAIL"
+
+# ─── Step 5: Scheduled Backfill ────────────────────────────
+PLIST_SRC="$REPO_DIR/config/com.claude.session-search-backfill.plist"
+PLIST_DST="$HOME/Library/LaunchAgents/com.claude.session-search-backfill.plist"
+
+$_UI_IS_TTY && printf '%b' "$_CL"
+inst_step_active "Scheduler" "registering weekly backfill..."
+
+if [ -f "$PLIST_SRC" ]; then
+    # Unload old version if exists
+    launchctl unload "$PLIST_DST" 2>/dev/null || true
+    cp "$PLIST_SRC" "$PLIST_DST"
+    launchctl load "$PLIST_DST" 2>/dev/null || true
+    inst_step_replace "Scheduler" "weekly backfill registered"
+else
+    inst_step_replace "Scheduler" "plist not found, skipped"
+fi
 
 # ─── Summary ────────────────────────────────────────────────
 

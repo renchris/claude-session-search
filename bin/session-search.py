@@ -234,6 +234,37 @@ class QueryPipeline:
             self.conn.row_factory = sqlite3.Row
         return self.conn
 
+    def _check_index_freshness(self):
+        """Auto-trigger incremental backfill if index is stale (>7 days)."""
+        try:
+            row = self.conn.execute(
+                "SELECT value FROM meta WHERE key = 'last_backfill'"
+            ).fetchone()
+            if row:
+                last = datetime.fromisoformat(row[0].replace('Z', '+00:00'))
+                age = datetime.now(timezone.utc) - last
+                if age < timedelta(days=7):
+                    return  # Fresh enough
+
+            # Index is stale — run quick backfill in background
+            import subprocess
+            repo_dir = os.environ.get("SESSION_SEARCH_REPO", "")
+            if not repo_dir:
+                # Try to find repo from script location
+                script_dir = Path(__file__).resolve().parent
+                repo_dir = str(script_dir.parent)
+
+            backfill = Path(repo_dir) / "scripts" / "session-index-backfill.sh"
+            if backfill.exists():
+                subprocess.Popen(
+                    ["bash", str(backfill), "--since", "7", "--quiet"],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    start_new_session=True,  # Detach from parent
+                )
+        except Exception:
+            pass  # Never let freshness check break search
+
     @staticmethod
     def _parse_inline_syntax(query: str) -> tuple[str, str | None, list[str]]:
         """Parse @project and #tag shortcuts from query.
@@ -259,6 +290,7 @@ class QueryPipeline:
 
     def search(self, raw_query, limit=10, project_filter=None, date_after=None, date_before=None, min_messages=0):
         conn = self._connect()
+        self._check_index_freshness()
         synonyms = load_synonyms(conn)
         known_terms = set(synonyms.keys())
         # Add all expansion values too

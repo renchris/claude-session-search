@@ -946,7 +946,7 @@ def main() -> None:
 
         # Batch update in a single transaction
         try:
-            conn.execute("BEGIN TRANSACTION")
+            conn.execute("BEGIN IMMEDIATE")
             for result in successful:
                 if args.retag_summaries:
                     # Only update summary; preserve existing tags
@@ -978,20 +978,30 @@ def main() -> None:
             conn.close()
             sys.exit(1)
 
-        # Rebuild FTS index
-        try:
-            conn.execute("DELETE FROM sessions_fts")
-            conn.execute(
-                "INSERT INTO sessions_fts "
-                "(session_id, summary, first_prompt, tags, keywords, project_name, "
-                "context_text, assistant_text, files_changed, commands_run) "
-                "SELECT session_id, summary, first_prompt, tags, keywords, project_name, "
-                "context_text, assistant_text, files_changed, commands_run FROM sessions"
-            )
-            conn.commit()
-        except sqlite3.Error as e:
-            log(f"FTS rebuild failed: {e}")
-            # Non-fatal: tags are persisted, FTS will rebuild on next backfill
+        # Incremental FTS update (only changed rows, not full rebuild)
+        # Full DELETE+INSERT holds exclusive lock 1-2s on 991 sessions.
+        # Incremental: ~5ms per row, no global lock contention.
+        updated_sids = [r.session_id for r in successful]
+        if updated_sids:
+            try:
+                placeholders = ",".join("?" * len(updated_sids))
+                conn.execute(
+                    f"DELETE FROM sessions_fts WHERE session_id IN ({placeholders})",
+                    updated_sids,
+                )
+                conn.execute(
+                    f"INSERT INTO sessions_fts "
+                    f"(session_id, summary, first_prompt, tags, keywords, project_name, "
+                    f"context_text, assistant_text, files_changed, commands_run) "
+                    f"SELECT session_id, summary, first_prompt, tags, keywords, project_name, "
+                    f"context_text, assistant_text, files_changed, commands_run "
+                    f"FROM sessions WHERE session_id IN ({placeholders})",
+                    updated_sids,
+                )
+                conn.commit()
+            except sqlite3.Error as e:
+                log(f"FTS incremental update failed: {e}")
+                # Non-fatal: tags are persisted, FTS will rebuild on next backfill
 
     conn.close()
 

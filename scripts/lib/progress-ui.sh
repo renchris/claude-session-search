@@ -310,11 +310,11 @@ ui_summary() {
 # ui_cursor_hide / ui_cursor_show
 # Hide/show cursor for cleaner progress display. Always restore on exit.
 ui_cursor_hide() {
-    $_UI_IS_TTY && printf '%b' "$_HIDE"
+    $_UI_IS_TTY && printf '%b' "$_HIDE" || true
 }
 
 ui_cursor_show() {
-    $_UI_IS_TTY && printf '%b' "$_SHOW"
+    $_UI_IS_TTY && printf '%b' "$_SHOW" || true
 }
 
 # ─── Update Throttle ─────────────────────────────────────────
@@ -341,6 +341,6 @@ ui_should_update() {
 
 # Ensure cursor is restored if script exits unexpectedly.
 _ui_cleanup() {
-    $_UI_IS_TTY && printf '%b' "$_SHOW"
+    $_UI_IS_TTY && printf '%b' "$_SHOW" || true
 }
 trap '_ui_cleanup' EXIT

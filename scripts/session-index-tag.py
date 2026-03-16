@@ -712,6 +712,23 @@ def main() -> None:
     signal.signal(signal.SIGINT, cleanup_handler)
     signal.signal(signal.SIGTERM, cleanup_handler)
 
+    # ─── Acquire script-level lock ─────────────────────────────────
+
+    lock_path = Path.home() / ".claude" / "session-index.lock"
+    lock_file = None
+    try:
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        lock_file = open(lock_path, "w")
+        import fcntl
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except (OSError, IOError):
+        if lock_file:
+            lock_file.close()
+        print("Another tagger or backfill is running. Wait or retry.", file=sys.stderr)
+        sys.exit(1)
+    except ImportError:
+        pass  # fcntl not available on Windows — skip locking
+
     # ─── API key detection ────────────────────────────────────────
 
     api_key = os.environ.get("ANTHROPIC_API_KEY", "")

@@ -47,6 +47,10 @@ fi
 
 session_index_init_db
 
+# ─── Acquire exclusive lock (blocks if tagger/another backfill is running) ───
+
+session_index_lock
+
 # ─── Pre-count totals for progress tracking ────────────────
 
 _backfill_start=$(_ui_now)

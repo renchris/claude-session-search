@@ -27,6 +27,12 @@ source "$HELPERS"
 # Init DB (idempotent)
 session_index_init_db
 
+# Non-blocking lock — skip if backfill/tagger is running (hook must be <200ms)
+if ! session_index_trylock; then
+    session_index_log "Skipped indexing $SESSION_ID (lock held by another process)"
+    exit 0
+fi
+
 # Derive project directory from transcript path or cwd
 PROJECT_DIR=""
 if [ -n "$TRANSCRIPT_PATH" ]; then

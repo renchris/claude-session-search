@@ -26,6 +26,89 @@ session_index_log() {
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] $msg" >> "$SESSION_INDEX_LOG"
 }
 
+# ─── Safe SQLite Wrapper ──────────────────────────────────
+# Every sqlite3 CLI invocation MUST use this wrapper to ensure busy_timeout
+# is set. Raw `sqlite3 "$SESSION_INDEX_DB"` spawns a fresh process with 0ms
+# timeout, causing SQLITE_BUSY crashes under concurrent access.
+#
+# Usage:
+#   session_index_sql "SELECT COUNT(*) FROM sessions;"
+#   session_index_sql <<'SQL'
+#   INSERT INTO sessions (...) VALUES (...);
+#   SQL
+
+SESSION_INDEX_BUSY_TIMEOUT="${SESSION_INDEX_BUSY_TIMEOUT:-5000}"
+
+session_index_sql() {
+    if [ $# -gt 0 ]; then
+        sqlite3 "$SESSION_INDEX_DB" ".timeout $SESSION_INDEX_BUSY_TIMEOUT" "$1"
+    else
+        # Read SQL from stdin (heredoc)
+        local sql
+        sql=$(cat)
+        sqlite3 "$SESSION_INDEX_DB" ".timeout $SESSION_INDEX_BUSY_TIMEOUT" "$sql"
+    fi
+}
+
+# ─── Script-Level Lock ────────────────────────────────────
+# Prevents concurrent heavy writers (backfill, tagger) from conflicting.
+# Hooks use non-blocking mode and skip if locked.
+#
+# Usage:
+#   session_index_lock         # blocking — waits for lock (backfill/tagger)
+#   session_index_trylock      # non-blocking — returns 1 if locked (hooks)
+#   session_index_unlock       # release (called automatically on EXIT)
+
+SESSION_INDEX_LOCKFILE="$HOME/.claude/session-index.lock"
+_SESSION_INDEX_LOCK_FD=""
+
+session_index_lock() {
+    mkdir -p "$(dirname "$SESSION_INDEX_LOCKFILE")"
+    exec 9>"$SESSION_INDEX_LOCKFILE"
+    _SESSION_INDEX_LOCK_FD=9
+    if ! flock -x 9 2>/dev/null; then
+        # flock not available on some macOS — fall back to mkdir lock
+        local _attempts=0
+        while ! mkdir "$SESSION_INDEX_LOCKFILE.d" 2>/dev/null; do
+            _attempts=$((_attempts + 1))
+            if [ "$_attempts" -ge 300 ]; then
+                session_index_log "Lock timeout after 300s, proceeding anyway"
+                return 0
+            fi
+            sleep 1
+        done
+        _SESSION_INDEX_LOCK_FD="mkdir"
+    fi
+    trap 'session_index_unlock' EXIT
+}
+
+session_index_trylock() {
+    mkdir -p "$(dirname "$SESSION_INDEX_LOCKFILE")"
+    exec 9>"$SESSION_INDEX_LOCKFILE"
+    if flock -n -x 9 2>/dev/null; then
+        _SESSION_INDEX_LOCK_FD=9
+        trap 'session_index_unlock' EXIT
+        return 0
+    fi
+    # flock unavailable or lock held
+    if mkdir "$SESSION_INDEX_LOCKFILE.d" 2>/dev/null; then
+        _SESSION_INDEX_LOCK_FD="mkdir"
+        trap 'session_index_unlock' EXIT
+        return 0
+    fi
+    return 1
+}
+
+session_index_unlock() {
+    if [ "$_SESSION_INDEX_LOCK_FD" = "mkdir" ]; then
+        rmdir "$SESSION_INDEX_LOCKFILE.d" 2>/dev/null || true
+    elif [ -n "$_SESSION_INDEX_LOCK_FD" ]; then
+        flock -u "$_SESSION_INDEX_LOCK_FD" 2>/dev/null || true
+        exec 9>&- 2>/dev/null || true
+    fi
+    _SESSION_INDEX_LOCK_FD=""
+}
+
 # ─── Database Init ─────────────────────────────────────────
 # Uses standalone FTS5 (no content= sync) to avoid SQLite trigger restrictions.
 # FTS is rebuilt after bulk operations and kept in sync manually on single upserts.
@@ -140,7 +223,7 @@ session_index_upsert() {
     local now
     now=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
 
-    sqlite3 "$SESSION_INDEX_DB" <<SQL
+    session_index_sql <<SQL
 INSERT INTO sessions (session_id, project_path, project_name, summary, first_prompt,
     context_text, assistant_text, files_changed, commands_run,
     git_branch, created_at, modified_at, message_count, tags, keywords, source, indexed_at)
@@ -191,7 +274,7 @@ session_index_upsert_with_fts() {
     sid_escaped=$(echo "$session_id" | sed "s/'/''/g")
 
     # Remove old FTS entry, insert new one
-    sqlite3 "$SESSION_INDEX_DB" <<SQL
+    session_index_sql <<SQL
 DELETE FROM sessions_fts WHERE session_id = '$sid_escaped';
 INSERT INTO sessions_fts (session_id, summary, first_prompt, tags, keywords, project_name, context_text, assistant_text, files_changed, commands_run)
     SELECT session_id, summary, first_prompt, tags, keywords, project_name, context_text, assistant_text, files_changed, commands_run
@@ -416,17 +499,17 @@ session_index_stats() {
         return 1
     fi
     local total tagged projects last_indexed
-    total=$(sqlite3 "$SESSION_INDEX_DB" "SELECT COUNT(*) FROM sessions;" 2>/dev/null)
-    tagged=$(sqlite3 "$SESSION_INDEX_DB" "SELECT COUNT(*) FROM sessions WHERE tagged_at IS NOT NULL;" 2>/dev/null)
-    projects=$(sqlite3 "$SESSION_INDEX_DB" "SELECT COUNT(DISTINCT project_name) FROM sessions;" 2>/dev/null)
-    last_indexed=$(sqlite3 "$SESSION_INDEX_DB" "SELECT MAX(indexed_at) FROM sessions;" 2>/dev/null)
+    total=$(session_index_sql "SELECT COUNT(*) FROM sessions;" 2>/dev/null)
+    tagged=$(session_index_sql "SELECT COUNT(*) FROM sessions WHERE tagged_at IS NOT NULL;" 2>/dev/null)
+    projects=$(session_index_sql "SELECT COUNT(DISTINCT project_name) FROM sessions;" 2>/dev/null)
+    last_indexed=$(session_index_sql "SELECT MAX(indexed_at) FROM sessions;" 2>/dev/null)
     echo "Sessions: $total | Tagged: $tagged | Projects: $projects | Last indexed: $last_indexed"
 }
 
 # ─── Rebuild FTS (for bulk operations) ─────────────────────
 
 session_index_rebuild_fts() {
-    sqlite3 "$SESSION_INDEX_DB" <<'SQL'
+    session_index_sql <<'SQL'
 DELETE FROM sessions_fts;
 INSERT INTO sessions_fts (session_id, summary, first_prompt, tags, keywords, project_name, context_text, assistant_text, files_changed, commands_run)
     SELECT session_id, summary, first_prompt, tags, keywords, project_name, context_text, assistant_text, files_changed, commands_run FROM sessions;
@@ -444,6 +527,6 @@ session_index_load_synonyms() {
 
     jq -r '.[] | .term as $term | .category as $cat | .expansions[] | [$term, ., $cat] | @tsv' "$synonyms_file" | \
     while IFS=$'\t' read -r term expansion category; do
-        sqlite3 "$SESSION_INDEX_DB" "INSERT OR IGNORE INTO synonyms (term, expansion, category) VALUES ('$(echo "$term" | sed "s/'/''/g")', '$(echo "$expansion" | sed "s/'/''/g")', '$(echo "$category" | sed "s/'/''/g")');"
+        session_index_sql "INSERT OR IGNORE INTO synonyms (term, expansion, category) VALUES ('$(echo "$term" | sed "s/'/''/g")', '$(echo "$expansion" | sed "s/'/''/g")', '$(echo "$category" | sed "s/'/''/g")');"
     done
 }

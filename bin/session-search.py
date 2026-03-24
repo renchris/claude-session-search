@@ -524,7 +524,12 @@ class QueryPipeline:
                    highlight(sessions_fts, 1, '\x02', '\x03') AS summary_hl,
                    highlight(sessions_fts, 6, '\x02', '\x03') AS context_hl,
                    highlight(sessions_fts, 7, '\x02', '\x03') AS assistant_hl,
-                   highlight(sessions_fts, 10, '\x02', '\x03') AS aliases_hl
+                   highlight(sessions_fts, 10, '\x02', '\x03') AS aliases_hl,
+                   snippet(sessions_fts, 1, '\x02', '\x03', '...', 24) AS summary_snip,
+                   snippet(sessions_fts, 2, '\x02', '\x03', '...', 24) AS prompt_snip,
+                   snippet(sessions_fts, 6, '\x02', '\x03', '...', 24) AS context_snip,
+                   snippet(sessions_fts, 7, '\x02', '\x03', '...', 24) AS assistant_snip,
+                   snippet(sessions_fts, 10, '\x02', '\x03', '...', 24) AS aliases_snip
             FROM sessions_fts
             JOIN sessions s ON s.session_id = sessions_fts.session_id
             WHERE sessions_fts MATCH ?
@@ -574,6 +579,11 @@ class QueryPipeline:
                 "context_hl": row["context_hl"] if "context_hl" in row.keys() else "",
                 "assistant_hl": row["assistant_hl"] if "assistant_hl" in row.keys() else "",
                 "aliases_hl": row["aliases_hl"] if "aliases_hl" in row.keys() else "",
+                "summary_snip": row["summary_snip"] if "summary_snip" in row.keys() else "",
+                "prompt_snip": row["prompt_snip"] if "prompt_snip" in row.keys() else "",
+                "context_snip": row["context_snip"] if "context_snip" in row.keys() else "",
+                "assistant_snip": row["assistant_snip"] if "assistant_snip" in row.keys() else "",
+                "aliases_snip": row["aliases_snip"] if "aliases_snip" in row.keys() else "",
             })
         return results
 
@@ -1211,8 +1221,8 @@ def _render_highlights(text, bold_start="\033[1;36m", bold_end="\033[0m"):
     return text.replace("\x02", bold_start).replace("\x03", bold_end)
 
 
-def _extract_highlight_snippet(text, max_len=100):
-    """Extract a snippet around the first FTS5 highlight marker.
+def _extract_highlight_snippet_legacy(text, max_len=100):
+    """Extract a snippet around the first FTS5 highlight marker (legacy).
 
     Returns a plain string with \\x02/\\x03 markers preserved (caller renders ANSI).
     Returns empty string if no highlight markers found.
@@ -1241,6 +1251,61 @@ def _extract_highlight_snippet(text, max_len=100):
         pattern = re.compile(re.escape(term), re.IGNORECASE)
         snippet_with_ellipsis = pattern.sub(f"\x02{term}\x03", snippet_with_ellipsis)
     return snippet_with_ellipsis
+
+
+def _score_and_select_snippets(result, max_snippets=2, max_len=100):
+    """Score snippet candidates from FTS5 snippet() and return the best ones.
+
+    Scores by: highlight marker density x source priority.
+    Returns list of snippet strings with \\x02/\\x03 markers preserved.
+    """
+    SOURCE_PRIORITY = {
+        'context_snip': 4,
+        'assistant_snip': 3,
+        'prompt_snip': 2,
+        'aliases_snip': 1,
+        'summary_snip': 0,  # summary already shown as description
+    }
+    candidates = []
+    for key, priority in SOURCE_PRIORITY.items():
+        snip = result.get(key, '')
+        if not snip or '\x02' not in snip:
+            continue
+        # Score: highlight count x priority / text length
+        hl_count = snip.count('\x02')
+        plain_len = max(1, len(snip.replace('\x02', '').replace('\x03', '')))
+        density = hl_count / plain_len
+        score = density * (priority + 1)  # +1 so priority 0 still contributes
+        # Truncate to max_len
+        plain = snip.replace('\x02', '').replace('\x03', '')
+        if len(plain) > max_len:
+            snip = snip[:max_len + snip[:max_len].count('\x02') * 2 + snip[:max_len].count('\x03') * 2]
+        candidates.append((score, key, snip))
+
+    # Sort by score descending
+    candidates.sort(key=lambda x: x[0], reverse=True)
+
+    # Deduplicate: skip if >50% plain text overlap with already selected
+    selected = []
+    for score, key, snip in candidates:
+        if len(selected) >= max_snippets:
+            break
+        plain = snip.replace('\x02', '').replace('\x03', '').lower()
+        is_redundant = False
+        for _, _, prev_snip in selected:
+            prev_plain = prev_snip.replace('\x02', '').replace('\x03', '').lower()
+            # Simple overlap check: shared words / total words
+            words_a = set(plain.split())
+            words_b = set(prev_plain.split())
+            if words_a and words_b:
+                overlap = len(words_a & words_b) / max(len(words_a), len(words_b))
+                if overlap > 0.5:
+                    is_redundant = True
+                    break
+        if not is_redundant:
+            selected.append((score, key, snip))
+
+    return [snip for _, _, snip in selected]
 
 
 def _get_term_width():
@@ -1432,19 +1497,14 @@ def format_table(results, elapsed_ms=0, pipeline=None, raw_query=None, explain=F
             sid_pad = content - meta_left_vis - COL_SID
             print(f"  {' ' * GUTTER}{meta_left}{' ' * max(1, sid_pad)}{sid_col}")
 
-        # ─── Highlight Snippets (context + assistant) ─────
-        # Show excerpts from context_hl and assistant_hl when they contain matches
-        # that aren't already visible in the summary description line.
+        # ─── Ranked Snippets (best 1-2 from all content columns) ─────
         if color:
             HL_SNIPPET_ON = "\033[1;36m"   # bold+cyan
             HL_SNIPPET_OFF = "\033[0;90m"  # reset to gray (snippet text is dim)
-            for label, key in [("context", "context_hl"), ("assistant", "assistant_hl")]:
-                hl_text = r.get(key, "")
-                if hl_text and "\x02" in hl_text:
-                    snippet = _extract_highlight_snippet(hl_text, max_len=content - 12)
-                    if snippet:
-                        rendered = snippet.replace("\x02", HL_SNIPPET_ON).replace("\x03", HL_SNIPPET_OFF)
-                        print(f"  {' ' * GUTTER}{GRAY}{THIN_V} {label}: {rendered}{R}")
+            snippets = _score_and_select_snippets(r, max_snippets=2, max_len=content - 8)
+            for snip_text in snippets:
+                rendered = snip_text.replace("\x02", HL_SNIPPET_ON).replace("\x03", HL_SNIPPET_OFF)
+                print(f"  {' ' * GUTTER}{GRAY}{THIN_V} {rendered}{R}")
 
         # Explain match (if --explain flag is active)
         if explain and pipeline and raw_query and tokens:

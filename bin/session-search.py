@@ -296,7 +296,7 @@ class QueryPipeline:
         clean = re.sub(r'\s+', ' ', clean)
         return clean, project, tags
 
-    def search(self, raw_query, limit=10, project_filter=None, date_after=None, date_before=None, min_messages=0):
+    def search(self, raw_query, limit=10, project_filter=None, date_after=None, date_before=None, min_messages=0, deep_search=False):
         conn = self._connect()
         self._check_index_freshness()
         synonyms = load_synonyms(conn)
@@ -405,6 +405,17 @@ class QueryPipeline:
                 # Merge via RRF
                 results = self._reciprocal_rank_fusion([results, llm_results])[:limit * 2]
                 self._last_strategy = getattr(self, '_last_strategy', 'none') + " + LLM expansion"
+
+        # 6c. Deep search: also query chunks_fts
+        if deep_search:
+            chunk_fts_query = build_fts5_query(corrected) if corrected else None
+            if chunk_fts_query:
+                chunk_results = self._execute_chunk_query(
+                    chunk_fts_query, limit, project_filter, auto_date_range
+                )
+                if chunk_results:
+                    results = self._reciprocal_rank_fusion([results, chunk_results])[:limit * 2]
+                    self._last_strategy = getattr(self, '_last_strategy', 'none') + " + deep"
 
         # 7. Normalize BM25 scores and apply additive scoring
         if results:
@@ -586,6 +597,76 @@ class QueryPipeline:
                 "aliases_snip": row["aliases_snip"] if "aliases_snip" in row.keys() else "",
             })
         return results
+
+    def _execute_chunk_query(self, fts_query, limit, project_filter, date_range):
+        """Search chunks_fts and return session-level results with chunk context."""
+        conn = self._connect()
+        try:
+            conn.execute("SELECT 1 FROM chunks_fts LIMIT 0")
+        except sqlite3.OperationalError:
+            return []  # chunks_fts doesn't exist yet
+
+        sql = """
+            SELECT c.chunk_id, c.session_id, c.start_turn, c.end_turn,
+                   s.project_path, s.project_name, s.summary, s.first_prompt,
+                   s.context_text, s.git_branch, s.created_at, s.modified_at,
+                   s.message_count, s.tags, s.keywords, s.source,
+                   bm25(chunks_fts, 0.0, 0.0, 3.0, 1.5, 3.5, 1.0) AS chunk_bm25,
+                   snippet(chunks_fts, 2, '\x02', '\x03', '...', 24) AS chunk_user_snip,
+                   snippet(chunks_fts, 3, '\x02', '\x03', '...', 24) AS chunk_asst_snip
+            FROM chunks_fts
+            JOIN session_chunks c ON c.chunk_id = chunks_fts.chunk_id
+            JOIN sessions s ON s.session_id = c.session_id
+            WHERE chunks_fts MATCH ?
+        """
+        params = [fts_query]
+
+        if project_filter:
+            sql += " AND s.project_name LIKE ?"
+            params.append(f"%{project_filter}%")
+
+        if date_range:
+            start, end = date_range
+            sql += " AND s.created_at >= ? AND s.created_at <= ?"
+            params.append(start.strftime("%Y-%m-%dT%H:%M:%SZ"))
+            params.append(end.strftime("%Y-%m-%dT%H:%M:%SZ"))
+
+        sql += " ORDER BY chunk_bm25 LIMIT ?"
+        params.append(limit * 3)
+
+        try:
+            rows = conn.execute(sql, params).fetchall()
+        except sqlite3.OperationalError:
+            return []
+
+        # Deduplicate: keep best chunk per session_id
+        seen = {}
+        for row in rows:
+            sid = row["session_id"]
+            if sid not in seen:
+                seen[sid] = {
+                    "session_id": sid,
+                    "project_path": row["project_path"],
+                    "project_name": row["project_name"],
+                    "summary": row["summary"],
+                    "first_prompt": row["first_prompt"],
+                    "context_text": row["context_text"],
+                    "git_branch": row["git_branch"],
+                    "created_at": row["created_at"],
+                    "modified_at": row["modified_at"],
+                    "message_count": row["message_count"],
+                    "tags": row["tags"],
+                    "keywords": row["keywords"],
+                    "source": row["source"],
+                    "bm25": abs(row["chunk_bm25"]),
+                    "summary_hl": "", "context_hl": "", "assistant_hl": "", "aliases_hl": "",
+                    "summary_snip": "", "prompt_snip": "",
+                    "context_snip": row["chunk_user_snip"] or "",
+                    "assistant_snip": row["chunk_asst_snip"] or "",
+                    "aliases_snip": "",
+                    "chunk_context": f"turns {row['start_turn']}-{row['end_turn']}",
+                }
+        return list(seen.values())[:limit]
 
     def _llm_expand_query(self, raw_query, limit, project_filter, date_range, min_messages):
         """Fallback: ask Haiku to rewrite query into keyword variants."""
@@ -1506,6 +1587,12 @@ def format_table(results, elapsed_ms=0, pipeline=None, raw_query=None, explain=F
                 rendered = snip_text.replace("\x02", HL_SNIPPET_ON).replace("\x03", HL_SNIPPET_OFF)
                 print(f"  {' ' * GUTTER}{GRAY}{THIN_V} {rendered}{R}")
 
+        # Show chunk context indicator if result came from deep search
+        if r.get("chunk_context"):
+            chunk_info = r["chunk_context"]
+            if color:
+                print(f"  {' ' * GUTTER}{GRAY}{THIN_V} [{chunk_info}]{R}")
+
         # Explain match (if --explain flag is active)
         if explain and pipeline and raw_query and tokens:
             explanation = pipeline._explain_match(r, tokens, raw_query)
@@ -1685,6 +1772,7 @@ def main():
     parser.add_argument("--explain", action="store_true", help="Show match explanation for each result")
     parser.add_argument("--analytics", action="store_true", help="Show search log analytics")
     parser.add_argument("--fails", action="store_true", help="Show only zero-result queries (with --analytics)")
+    parser.add_argument("--deep-search", action="store_true", help="Also search within session chunks for deeper matches")
     args = parser.parse_args()
 
     if not DB_PATH.exists():
@@ -1767,6 +1855,7 @@ def main():
                     query, limit=args.limit, project_filter=args.project,
                     date_after=args.after, date_before=args.before,
                     min_messages=args.min_msgs,
+                    deep_search=args.deep_search,
                 )
                 _cache_results(results)
             else:
@@ -1805,6 +1894,7 @@ def main():
             date_after=args.after,
             date_before=args.before,
             min_messages=args.min_msgs,
+            deep_search=args.deep_search,
         )
         elapsed_ms = int((time.monotonic() - t0) * 1000)
 

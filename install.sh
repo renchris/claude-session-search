@@ -148,12 +148,14 @@ symlink_file "$REPO_DIR/bin/session-search.py" "$BIN_DIR/session-search.py"
 symlink_file "$REPO_DIR/bin/claude-search" "$BIN_DIR/claude-search"
 symlink_file "$REPO_DIR/scripts/session-index-tag.py" "$BIN_DIR/session-index-tag.py"
 symlink_file "$REPO_DIR/scripts/session-index-backfill.sh" "$BIN_DIR/session-index-backfill.sh"
+symlink_file "$REPO_DIR/scripts/session-index-chunk.py" "$BIN_DIR/session-index-chunk.py"
 
 chmod +x "$HOOKS_DIR/session-index-end.sh" "$HOOKS_DIR/session-index-start.sh" \
          "$HOOKS_DIR/session-index-sweep.sh" \
          "$BIN_DIR/claude-search" "$BIN_DIR/session-search.py" \
          "$REPO_DIR/scripts/session-index-tag.py" \
-         "$REPO_DIR/scripts/session-index-backfill.sh"
+         "$REPO_DIR/scripts/session-index-backfill.sh" \
+         "$REPO_DIR/scripts/session-index-chunk.py" 2>/dev/null || true
 
 # Pre-compile Python for faster startup
 python3 -m compileall -q "$BIN_DIR/session-search.py" 2>/dev/null || true

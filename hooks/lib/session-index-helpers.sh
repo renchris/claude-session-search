@@ -212,6 +212,26 @@ CREATE TABLE IF NOT EXISTS meta (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS session_chunks (
+    chunk_id      TEXT PRIMARY KEY,
+    session_id    TEXT NOT NULL,
+    chunk_index   INTEGER NOT NULL,
+    start_turn    INTEGER NOT NULL,
+    end_turn      INTEGER NOT NULL,
+    user_text     TEXT NOT NULL DEFAULT '',
+    assistant_text TEXT NOT NULL DEFAULT '',
+    files_mentioned TEXT NOT NULL DEFAULT '',
+    commands_mentioned TEXT NOT NULL DEFAULT '',
+    UNIQUE(session_id, chunk_index)
+);
+CREATE INDEX IF NOT EXISTS idx_chunks_session ON session_chunks(session_id);
+
+CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(
+    chunk_id, session_id, user_text, assistant_text, files_mentioned, commands_mentioned,
+    tokenize='porter unicode61 remove_diacritics 1',
+    prefix='2 3'
+);
 SCHEMA
 }
 
@@ -530,6 +550,14 @@ session_index_rebuild_fts() {
 DELETE FROM sessions_fts;
 INSERT INTO sessions_fts (session_id, summary, first_prompt, tags, keywords, project_name, context_text, assistant_text, files_changed, commands_run, search_aliases)
     SELECT session_id, summary, first_prompt, tags, keywords, project_name, context_text, assistant_text, files_changed, commands_run, search_aliases FROM sessions;
+SQL
+}
+
+session_index_rebuild_chunks_fts() {
+    session_index_sql <<'SQL'
+DELETE FROM chunks_fts;
+INSERT INTO chunks_fts (chunk_id, session_id, user_text, assistant_text, files_mentioned, commands_mentioned)
+    SELECT chunk_id, session_id, user_text, assistant_text, files_mentioned, commands_mentioned FROM session_chunks;
 SQL
 }
 

@@ -638,6 +638,23 @@ sqlite3 "$SESSION_INDEX_DB" "INSERT INTO sessions_fts(sessions_fts) VALUES ('opt
 _fts_count=$(sqlite3 "$SESSION_INDEX_DB" "SELECT COUNT(*) FROM sessions_fts;" 2>/dev/null || echo 0)
 ui_phase_done "Phase 6: FTS rebuild" "$_fts_count entries, $_syn_count synonyms" "$_p6_start"
 
+# ─── Phase 7: Generate search chunks ─────────────────────
+
+_p7_start=$(_ui_now)
+CHUNK_SCRIPT="$REPO_DIR/scripts/session-index-chunk.py"
+if [ -f "$CHUNK_SCRIPT" ]; then
+    ui_phase_active_simple "Phase 7: Chunk generation" "generating chunks..." "$_p7_start"
+    if [ -n "${SINCE_DAYS:-}" ]; then
+        python3 "$CHUNK_SCRIPT" --backfill --since "$SINCE_DAYS" 2>/dev/null
+    else
+        python3 "$CHUNK_SCRIPT" --backfill 2>/dev/null
+    fi
+    _chunk_count=$(sqlite3 "$SESSION_INDEX_DB" ".timeout 5000" "SELECT COUNT(*) FROM session_chunks;" 2>/dev/null || echo 0)
+    ui_phase_done "Phase 7: Chunk generation" "$_chunk_count chunks" "$_p7_start"
+else
+    ui_phase_skip "Phase 7: Chunk generation" "chunk script not found"
+fi
+
 # ─── Summary ──────────────────────────────────────────────
 
 total=$(sqlite3 "$SESSION_INDEX_DB" "SELECT COUNT(*) FROM sessions;" 2>/dev/null)

@@ -67,7 +67,12 @@ fi
         0 \
         "" \
         "" \
-        "session-start"
+        "session-start" \
+        "" \
+        "" \
+        "" \
+        "" \
+        ""
 
     session_index_log "Stub indexed for $SESSION_ID ($PROJECT_NAME)"
 ) &

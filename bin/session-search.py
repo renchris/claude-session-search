@@ -512,17 +512,19 @@ class QueryPipeline:
     def _execute_query(self, fts_query, limit, project_filter, date_range, min_messages=0):
         conn = self._connect()
         # Standalone FTS5 table — join on session_id column
-        # BM25 weights (10 columns):
+        # BM25 weights (11 columns):
         #   session_id(0), summary(12), first_prompt(3), tags(5), keywords(3),
-        #   project_name(0.5), context_text(2.5), assistant_text(1.5), files_changed(3.5), commands_run(1)
+        #   project_name(0.5), context_text(2.5), assistant_text(1.5), files_changed(3.5),
+        #   commands_run(1), search_aliases(8)
         sql = """
             SELECT s.session_id, s.project_path, s.project_name, s.summary,
                    s.first_prompt, s.context_text, s.git_branch, s.created_at,
                    s.modified_at, s.message_count, s.tags, s.keywords, s.source,
-                   bm25(sessions_fts, 0.0, 12.0, 3.0, 5.0, 3.0, 0.5, 2.5, 1.5, 3.5, 1.0) AS bm25_score,
+                   bm25(sessions_fts, 0.0, 12.0, 3.0, 5.0, 3.0, 0.5, 2.5, 1.5, 3.5, 1.0, 8.0) AS bm25_score,
                    highlight(sessions_fts, 1, '\x02', '\x03') AS summary_hl,
                    highlight(sessions_fts, 6, '\x02', '\x03') AS context_hl,
-                   highlight(sessions_fts, 7, '\x02', '\x03') AS assistant_hl
+                   highlight(sessions_fts, 7, '\x02', '\x03') AS assistant_hl,
+                   highlight(sessions_fts, 10, '\x02', '\x03') AS aliases_hl
             FROM sessions_fts
             JOIN sessions s ON s.session_id = sessions_fts.session_id
             WHERE sessions_fts MATCH ?
@@ -571,6 +573,7 @@ class QueryPipeline:
                 "summary_hl": row["summary_hl"] if "summary_hl" in row.keys() else "",
                 "context_hl": row["context_hl"] if "context_hl" in row.keys() else "",
                 "assistant_hl": row["assistant_hl"] if "assistant_hl" in row.keys() else "",
+                "aliases_hl": row["aliases_hl"] if "aliases_hl" in row.keys() else "",
             })
         return results
 
@@ -820,6 +823,7 @@ class QueryPipeline:
             'assistant_text': result.get('assistant_hl', ''),
             'files_changed': result.get('files_changed', ''),
             'commands_run': result.get('commands_run', ''),
+            'search_aliases': result.get('aliases_hl', ''),
         }
 
         for token in tokens:

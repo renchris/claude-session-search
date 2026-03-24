@@ -102,7 +102,8 @@ for project_dir in "$CLAUDE_PROJECTS_DIR"/*/; do
             "$context_text" \
             "$assistant_text" \
             "$files_changed" \
-            "$commands_run"
+            "$commands_run" \
+            ""
 
         # Update sweep columns on sessions
         sid_escaped=$(echo "$sid" | sed "s/'/''/g")
@@ -181,7 +182,8 @@ SQL
             "$context_text" \
             "$assistant_text" \
             "$files_changed" \
-            "$commands_run"
+            "$commands_run" \
+            ""
 
         sid_escaped=$(echo "$sid" | sed "s/'/''/g")
         session_index_sql "UPDATE sessions SET sweep_mtime = $file_mtime, sweep_size = $file_size WHERE session_id = '$sid_escaped';"

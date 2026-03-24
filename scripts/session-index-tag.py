@@ -141,15 +141,17 @@ def regex_tag(text: str) -> list[str]:
 
 def _haiku_call_urllib(
     summary: str, first_prompt: str, project_name: str, api_key: str
-) -> tuple[list[str], str]:
-    """Call Haiku via urllib.request. Returns (tags, summary_text).
+) -> tuple[list[str], str, list[str]]:
+    """Call Haiku via urllib.request. Returns (tags, summary_text, aliases).
 
     Raises on any failure (network, parse, empty response).
     """
     prompt_text = (
         "Tag this Claude Code session. Return ONLY a JSON object with "
-        '"tags" (array of 5-10 lowercase-hyphenated tags) and "summary" '
-        "(one-line, max 80 chars).\n\n"
+        '"tags" (array of 5-10 lowercase-hyphenated tags), "summary" '
+        '(one-line, max 80 chars), and "aliases" (array of 5-15 search '
+        "terms someone might use to find this session: alternate phrasings, "
+        "abbreviations, related concepts, task-level descriptions).\n\n"
         f"Project: {project_name}\n"
         f"Summary: {summary}\n"
         f"First prompt: {first_prompt[:300]}"
@@ -158,7 +160,7 @@ def _haiku_call_urllib(
     payload = json.dumps(
         {
             "model": "claude-haiku-4-5-20251001",
-            "max_tokens": 150,
+            "max_tokens": 250,
             "messages": [{"role": "user", "content": prompt_text}],
         }
     ).encode()
@@ -193,20 +195,27 @@ def _haiku_call_urllib(
     if not isinstance(haiku_summary, str):
         haiku_summary = ""
 
-    return ([t for t in tags if isinstance(t, str)], haiku_summary)
+    aliases = parsed.get("aliases", [])
+    if not isinstance(aliases, list):
+        aliases = []
+    aliases = [str(a) for a in aliases if isinstance(a, str) and a.strip()]
+
+    return ([t for t in tags if isinstance(t, str)], haiku_summary, aliases)
 
 
 def _haiku_call_sdk(
     summary: str, first_prompt: str, project_name: str, api_key: str
-) -> tuple[list[str], str]:
+) -> tuple[list[str], str, list[str]]:
     """Call Haiku via the anthropic SDK if installed. Same interface as urllib variant."""
     import anthropic  # type: ignore[import-untyped]
 
     client = anthropic.Anthropic(api_key=api_key)
     prompt_text = (
         "Tag this Claude Code session. Return ONLY a JSON object with "
-        '"tags" (array of 5-10 lowercase-hyphenated tags) and "summary" '
-        "(one-line, max 80 chars).\n\n"
+        '"tags" (array of 5-10 lowercase-hyphenated tags), "summary" '
+        '(one-line, max 80 chars), and "aliases" (array of 5-15 search '
+        "terms someone might use to find this session: alternate phrasings, "
+        "abbreviations, related concepts, task-level descriptions).\n\n"
         f"Project: {project_name}\n"
         f"Summary: {summary}\n"
         f"First prompt: {first_prompt[:300]}"
@@ -214,7 +223,7 @@ def _haiku_call_sdk(
 
     message = client.messages.create(
         model="claude-haiku-4-5-20251001",
-        max_tokens=150,
+        max_tokens=250,
         messages=[{"role": "user", "content": prompt_text}],
     )
 
@@ -234,7 +243,12 @@ def _haiku_call_sdk(
     if not isinstance(haiku_summary, str):
         haiku_summary = ""
 
-    return ([t for t in tags if isinstance(t, str)], haiku_summary)
+    aliases = parsed.get("aliases", [])
+    if not isinstance(aliases, list):
+        aliases = []
+    aliases = [str(a) for a in aliases if isinstance(a, str) and a.strip()]
+
+    return ([t for t in tags if isinstance(t, str)], haiku_summary, aliases)
 
 
 # Detect SDK availability once at import time
@@ -249,25 +263,25 @@ except ImportError:
 
 def haiku_tag(
     summary: str, first_prompt: str, project_name: str, api_key: str
-) -> tuple[list[str], str, str]:
+) -> tuple[list[str], str, str, list[str]]:
     """Tag a session via Haiku API with SDK-first, urllib fallback.
 
-    Returns (tags, haiku_summary, method_or_error) where:
+    Returns (tags, haiku_summary, method_or_error, aliases) where:
       - On success: method_or_error is "haiku"
       - On API failure: method_or_error is "api_error"
       - On parse failure: method_or_error is "api_parse"
     """
     call_fn = _haiku_call_sdk if _HAS_ANTHROPIC_SDK else _haiku_call_urllib
     try:
-        tags, haiku_summary = call_fn(summary, first_prompt, project_name, api_key)
-        return (tags, haiku_summary, "haiku")
+        tags, haiku_summary, aliases = call_fn(summary, first_prompt, project_name, api_key)
+        return (tags, haiku_summary, "haiku", aliases)
     except (json.JSONDecodeError, ValueError, KeyError, IndexError, TypeError):
-        return ([], "", "api_parse")
+        return ([], "", "api_parse", [])
     except (HTTPError, URLError, TimeoutError, OSError):
-        return ([], "", "api_error")
+        return ([], "", "api_error", [])
     except Exception:
         # SDK-specific or unexpected errors
-        return ([], "", "api_error")
+        return ([], "", "api_error", [])
 
 
 # ─── Progress Bar ─────────────────────────────────────────────────
@@ -570,6 +584,7 @@ class TagResult:
         "session_id",
         "tags",
         "summary",
+        "aliases",
         "method",
         "error_category",
         "success",
@@ -580,6 +595,7 @@ class TagResult:
         session_id: str,
         tags: list[str],
         summary: str,
+        aliases: list[str],
         method: str,
         error_category: str,
         success: bool,
@@ -587,6 +603,7 @@ class TagResult:
         self.session_id = session_id
         self.tags = tags
         self.summary = summary
+        self.aliases = aliases
         self.method = method
         self.error_category = error_category
         self.success = success
@@ -613,9 +630,10 @@ def process_session(
 
     # Check for empty text
     if len(combined_text.strip()) < 10:
-        return TagResult(sid, [], "", "skip", "empty_text", False)
+        return TagResult(sid, [], "", [], "skip", "empty_text", False)
 
     tags: list[str] = []
+    aliases: list[str] = []
     haiku_summary = ""
     method = "regex"
     api_result = ""
@@ -630,7 +648,7 @@ def process_session(
             finally:
                 rate_semaphore.release()
 
-        tags, haiku_summary, api_result = haiku_tag(
+        tags, haiku_summary, api_result, aliases = haiku_tag(
             summary, first_prompt, project_name, api_key
         )
         if tags:
@@ -639,14 +657,15 @@ def process_session(
     # Fallback to regex if Haiku failed or was skipped
     if not tags:
         tags = regex_tag(combined_text)
+        aliases = []
         method = "regex"
 
     if tags:
-        return TagResult(sid, tags, haiku_summary, method, "", True)
+        return TagResult(sid, tags, haiku_summary, aliases, method, "", True)
 
     # Failed — classify the error
     error_cat = classify_failure(combined_text, tags, api_result)
-    return TagResult(sid, [], "", method, error_cat, False)
+    return TagResult(sid, [], "", [], method, error_cat, False)
 
 
 # ─── Main ─────────────────────────────────────────────────────────
@@ -867,7 +886,7 @@ def main() -> None:
                 error_counts[cat] = error_counts.get(cat, 0) + 1
 
             result = TagResult(
-                session["session_id"], tags, "", method,
+                session["session_id"], tags, "", [], method,
                 "" if success else classify_failure(combined, tags, ""),
                 success,
             )
@@ -962,11 +981,13 @@ def main() -> None:
                         summaries_added += 1
                 else:
                     tags_str = ",".join(result.tags)
+                    aliases_str = ", ".join(result.aliases)
                     conn.execute(
                         "UPDATE sessions SET tags=?, "
                         "summary=CASE WHEN ? != '' AND summary = '' THEN ? ELSE summary END, "
+                        "search_aliases=CASE WHEN ? != '' AND search_aliases = '' THEN ? ELSE search_aliases END, "
                         "tagged_at=? WHERE session_id=?",
-                        (tags_str, result.summary, result.summary, now, result.session_id),
+                        (tags_str, result.summary, result.summary, aliases_str, aliases_str, now, result.session_id),
                     )
             conn.execute("COMMIT")
         except sqlite3.Error as e:
@@ -992,9 +1013,9 @@ def main() -> None:
                 conn.execute(
                     f"INSERT INTO sessions_fts "
                     f"(session_id, summary, first_prompt, tags, keywords, project_name, "
-                    f"context_text, assistant_text, files_changed, commands_run) "
+                    f"context_text, assistant_text, files_changed, commands_run, search_aliases) "
                     f"SELECT session_id, summary, first_prompt, tags, keywords, project_name, "
-                    f"context_text, assistant_text, files_changed, commands_run "
+                    f"context_text, assistant_text, files_changed, commands_run, search_aliases "
                     f"FROM sessions WHERE session_id IN ({placeholders})",
                     updated_sids,
                 )

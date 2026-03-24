@@ -144,6 +144,19 @@ MIGRATE2
         fi
     fi
 
+    # Migrate: add search_aliases column if missing
+    if [ -f "$SESSION_INDEX_DB" ]; then
+        local has_aliases
+        has_aliases=$(sqlite3 "$SESSION_INDEX_DB" "PRAGMA table_info(sessions);" 2>/dev/null | grep -c 'search_aliases' || true)
+        if [ "$has_aliases" = "0" ]; then
+            sqlite3 "$SESSION_INDEX_DB" >/dev/null 2>&1 <<'MIGRATE3'
+ALTER TABLE sessions ADD COLUMN search_aliases TEXT NOT NULL DEFAULT '';
+DROP TABLE IF EXISTS sessions_fts;
+MIGRATE3
+            session_index_log "Migrated: added search_aliases column, FTS will be recreated"
+        fi
+    fi
+
     sqlite3 "$SESSION_INDEX_DB" >/dev/null <<'SCHEMA'
 PRAGMA journal_mode=WAL;
 PRAGMA synchronous=NORMAL;
@@ -159,6 +172,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     assistant_text TEXT NOT NULL DEFAULT '',
     files_changed  TEXT NOT NULL DEFAULT '',
     commands_run   TEXT NOT NULL DEFAULT '',
+    search_aliases TEXT NOT NULL DEFAULT '',
     git_branch    TEXT NOT NULL DEFAULT '',
     created_at    TEXT NOT NULL,
     modified_at   TEXT NOT NULL,
@@ -172,7 +186,7 @@ CREATE TABLE IF NOT EXISTS sessions (
 
 CREATE VIRTUAL TABLE IF NOT EXISTS sessions_fts USING fts5(
     session_id, summary, first_prompt, tags, keywords, project_name, context_text,
-    assistant_text, files_changed, commands_run,
+    assistant_text, files_changed, commands_run, search_aliases,
     tokenize='porter unicode61 remove_diacritics 1',
     prefix='2 3'
 );
@@ -220,12 +234,13 @@ session_index_upsert() {
     local assistant_text="${14:-}"
     local files_changed="${15:-}"
     local commands_run="${16:-}"
+    local search_aliases="${17:-}"
     local now
     now=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
 
     session_index_sql <<SQL
 INSERT INTO sessions (session_id, project_path, project_name, summary, first_prompt,
-    context_text, assistant_text, files_changed, commands_run,
+    context_text, assistant_text, files_changed, commands_run, search_aliases,
     git_branch, created_at, modified_at, message_count, tags, keywords, source, indexed_at)
 VALUES (
     '$(echo "$session_id" | sed "s/'/''/g")',
@@ -237,6 +252,7 @@ VALUES (
     '$(echo "$assistant_text" | sed "s/'/''/g")',
     '$(echo "$files_changed" | sed "s/'/''/g")',
     '$(echo "$commands_run" | sed "s/'/''/g")',
+    '$(echo "$search_aliases" | sed "s/'/''/g")',
     '$(echo "$git_branch" | sed "s/'/''/g")',
     '$(echo "$created_at" | sed "s/'/''/g")',
     '$(echo "$modified_at" | sed "s/'/''/g")',
@@ -255,6 +271,7 @@ ON CONFLICT(session_id) DO UPDATE SET
     assistant_text = CASE WHEN excluded.assistant_text != '' AND (excluded.source >= sessions.source OR sessions.assistant_text = '') THEN excluded.assistant_text ELSE sessions.assistant_text END,
     files_changed  = CASE WHEN excluded.files_changed != '' AND (excluded.source >= sessions.source OR sessions.files_changed = '') THEN excluded.files_changed ELSE sessions.files_changed END,
     commands_run   = CASE WHEN excluded.commands_run != '' AND (excluded.source >= sessions.source OR sessions.commands_run = '') THEN excluded.commands_run ELSE sessions.commands_run END,
+    search_aliases = CASE WHEN excluded.search_aliases != '' AND (excluded.source >= sessions.source OR sessions.search_aliases = '') THEN excluded.search_aliases ELSE sessions.search_aliases END,
     git_branch    = CASE WHEN excluded.git_branch != '' THEN excluded.git_branch ELSE sessions.git_branch END,
     modified_at   = CASE WHEN excluded.modified_at > sessions.modified_at THEN excluded.modified_at ELSE sessions.modified_at END,
     message_count = CASE WHEN excluded.message_count > sessions.message_count THEN excluded.message_count ELSE sessions.message_count END,
@@ -276,8 +293,8 @@ session_index_upsert_with_fts() {
     # Remove old FTS entry, insert new one
     session_index_sql <<SQL
 DELETE FROM sessions_fts WHERE session_id = '$sid_escaped';
-INSERT INTO sessions_fts (session_id, summary, first_prompt, tags, keywords, project_name, context_text, assistant_text, files_changed, commands_run)
-    SELECT session_id, summary, first_prompt, tags, keywords, project_name, context_text, assistant_text, files_changed, commands_run
+INSERT INTO sessions_fts (session_id, summary, first_prompt, tags, keywords, project_name, context_text, assistant_text, files_changed, commands_run, search_aliases)
+    SELECT session_id, summary, first_prompt, tags, keywords, project_name, context_text, assistant_text, files_changed, commands_run, search_aliases
     FROM sessions WHERE session_id = '$sid_escaped';
 SQL
 }
@@ -511,8 +528,8 @@ session_index_stats() {
 session_index_rebuild_fts() {
     session_index_sql <<'SQL'
 DELETE FROM sessions_fts;
-INSERT INTO sessions_fts (session_id, summary, first_prompt, tags, keywords, project_name, context_text, assistant_text, files_changed, commands_run)
-    SELECT session_id, summary, first_prompt, tags, keywords, project_name, context_text, assistant_text, files_changed, commands_run FROM sessions;
+INSERT INTO sessions_fts (session_id, summary, first_prompt, tags, keywords, project_name, context_text, assistant_text, files_changed, commands_run, search_aliases)
+    SELECT session_id, summary, first_prompt, tags, keywords, project_name, context_text, assistant_text, files_changed, commands_run, search_aliases FROM sessions;
 SQL
 }
 

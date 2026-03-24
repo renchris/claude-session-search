@@ -107,7 +107,8 @@ session_index_upsert_with_fts \
     "$CONTEXT_TEXT" \
     "$ASSISTANT_TEXT" \
     "$FILES_CHANGED" \
-    "$COMMANDS_RUN"
+    "$COMMANDS_RUN" \
+    ""
 
 session_index_log "Indexed session $SESSION_ID ($PROJECT_NAME, ${MSG_COUNT} msgs)"
 exit 0

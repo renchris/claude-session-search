@@ -29,10 +29,10 @@ source "$_UI_LIB"
 # The installer uses a "show all pending, then overwrite in-place" UX
 # that needs thin wrappers around the shared lib's ANSI variables.
 
-_INST_SYM_DONE="$_G✓$_R"
-_INST_SYM_FAIL="$_RD✗$_R"
-_INST_SYM_PENDING="$_D○$_R"
-_INST_SYM_ACTIVE="$_C⠹$_R"
+_INST_SYM_DONE="${_G}✓${_R}"
+_INST_SYM_FAIL="${_RD}✗${_R}"
+_INST_SYM_PENDING="${_D}○${_R}"
+_INST_SYM_ACTIVE="${_C}⠹${_R}"
 
 if ! $_UI_IS_TTY; then
     _INST_SYM_DONE="[ok]"

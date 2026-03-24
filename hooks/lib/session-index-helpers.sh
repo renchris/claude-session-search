@@ -530,3 +530,34 @@ session_index_load_synonyms() {
         session_index_sql "INSERT OR IGNORE INTO synonyms (term, expansion, category) VALUES ('$(echo "$term" | sed "s/'/''/g")', '$(echo "$expansion" | sed "s/'/''/g")', '$(echo "$category" | sed "s/'/''/g")');"
     done
 }
+
+# ─── File Tracking for Sweep Daemon ──────────────────────
+# Creates file_tracking table and adds sweep columns to sessions.
+# Idempotent — safe to call multiple times.
+
+session_index_init_tracking() {
+    [ -f "$SESSION_INDEX_DB" ] || return 0
+
+    session_index_sql <<'SQL'
+CREATE TABLE IF NOT EXISTS file_tracking (
+    file_path     TEXT PRIMARY KEY,
+    session_id    TEXT NOT NULL,
+    project_dir   TEXT NOT NULL,
+    last_mtime    INTEGER NOT NULL,
+    last_size     INTEGER NOT NULL,
+    last_swept_at TEXT NOT NULL,
+    sweep_count   INTEGER DEFAULT 1,
+    is_active     INTEGER DEFAULT 1
+);
+CREATE INDEX IF NOT EXISTS idx_tracking_session ON file_tracking(session_id);
+SQL
+
+    # Add sweep_mtime and sweep_size to sessions if missing
+    local has_sweep_mtime
+    has_sweep_mtime=$(session_index_sql "PRAGMA table_info(sessions);" 2>/dev/null | grep -c 'sweep_mtime' || true)
+    if [ "$has_sweep_mtime" = "0" ]; then
+        session_index_sql "ALTER TABLE sessions ADD COLUMN sweep_mtime INTEGER DEFAULT NULL;"
+        session_index_sql "ALTER TABLE sessions ADD COLUMN sweep_size INTEGER DEFAULT NULL;"
+        session_index_log "Migrated: added sweep_mtime, sweep_size columns to sessions"
+    fi
+}

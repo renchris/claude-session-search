@@ -35,4 +35,41 @@ if [ -n "$CONTEXT" ]; then
 EOF
 fi
 
+# ─── Layer 1: Crash-safe stub row ────────────────────────
+# Create a minimal index row so this session is discoverable even if
+# SessionEnd never fires (terminal kill, crash, etc.).
+# Runs in a subshell backgrounded to stay under 100ms total.
+(
+    SESSION_ID=$(echo "$INPUT" | jq -r '.session_id // empty' 2>/dev/null)
+    [ -z "$SESSION_ID" ] && exit 0
+
+    session_index_init_db
+
+    # Derive project info from CWD (same pattern as session-index-end.sh)
+    PROJECT_PATH="${CWD:-}"
+    if [ -z "$PROJECT_PATH" ]; then
+        PROJECT_PATH="unknown"
+    fi
+    PROJECT_NAME=$(session_index_project_name "$PROJECT_PATH")
+
+    NOW=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+
+    # UPSERT stub — lower priority source so SessionEnd always wins
+    session_index_upsert_with_fts \
+        "$SESSION_ID" \
+        "$PROJECT_PATH" \
+        "$PROJECT_NAME" \
+        "" \
+        "" \
+        "" \
+        "$NOW" \
+        "$NOW" \
+        0 \
+        "" \
+        "" \
+        "session-start"
+
+    session_index_log "Stub indexed for $SESSION_ID ($PROJECT_NAME)"
+) &
+
 exit 0

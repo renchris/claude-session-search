@@ -27,6 +27,7 @@ remove_symlink() {
 echo "Hooks:"
 remove_symlink "$HOOKS_DIR/session-index-end.sh"
 remove_symlink "$HOOKS_DIR/session-index-start.sh"
+remove_symlink "$HOOKS_DIR/session-index-sweep.sh"
 remove_symlink "$HOOKS_DIR/lib/session-index-helpers.sh"
 
 echo ""
@@ -73,6 +74,30 @@ if [ -f "$SETTINGS" ]; then
     fi
 else
     echo "  - settings.json not found"
+fi
+
+# ─── Unload LaunchAgents ──────────────────────────────────
+
+echo ""
+echo "LaunchAgents:"
+
+BACKFILL_PLIST="$HOME/Library/LaunchAgents/com.claude.session-search-backfill.plist"
+SWEEP_PLIST="$HOME/Library/LaunchAgents/com.claude.session-search-sweep.plist"
+
+if [ -f "$BACKFILL_PLIST" ]; then
+    launchctl unload "$BACKFILL_PLIST" 2>/dev/null || true
+    rm "$BACKFILL_PLIST"
+    echo "  ✓ Removed backfill plist"
+else
+    echo "  - backfill plist (not found)"
+fi
+
+if [ -f "$SWEEP_PLIST" ]; then
+    launchctl unload "$SWEEP_PLIST" 2>/dev/null || true
+    rm "$SWEEP_PLIST"
+    echo "  ✓ Removed sweep plist"
+else
+    echo "  - sweep plist (not found)"
 fi
 
 echo ""

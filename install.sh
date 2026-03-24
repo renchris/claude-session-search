@@ -142,6 +142,7 @@ mkdir -p "$HOOKS_DIR" "$HOOKS_LIB" "$BIN_DIR"
 
 symlink_file "$REPO_DIR/hooks/session-index-end.sh" "$HOOKS_DIR/session-index-end.sh"
 symlink_file "$REPO_DIR/hooks/session-index-start.sh" "$HOOKS_DIR/session-index-start.sh"
+symlink_file "$REPO_DIR/hooks/session-index-sweep.sh" "$HOOKS_DIR/session-index-sweep.sh"
 symlink_file "$REPO_DIR/hooks/lib/session-index-helpers.sh" "$HOOKS_LIB/session-index-helpers.sh"
 symlink_file "$REPO_DIR/bin/session-search.py" "$BIN_DIR/session-search.py"
 symlink_file "$REPO_DIR/bin/claude-search" "$BIN_DIR/claude-search"
@@ -149,9 +150,13 @@ symlink_file "$REPO_DIR/scripts/session-index-tag.py" "$BIN_DIR/session-index-ta
 symlink_file "$REPO_DIR/scripts/session-index-backfill.sh" "$BIN_DIR/session-index-backfill.sh"
 
 chmod +x "$HOOKS_DIR/session-index-end.sh" "$HOOKS_DIR/session-index-start.sh" \
+         "$HOOKS_DIR/session-index-sweep.sh" \
          "$BIN_DIR/claude-search" "$BIN_DIR/session-search.py" \
          "$REPO_DIR/scripts/session-index-tag.py" \
          "$REPO_DIR/scripts/session-index-backfill.sh"
+
+# Pre-compile Python for faster startup
+python3 -m compileall -q "$BIN_DIR/session-search.py" 2>/dev/null || true
 
 inst_step_replace "Symlinks" "hooks + bin linked"
 
@@ -235,19 +240,33 @@ fi
 
 inst_step_replace "PATH" "$PATH_DETAIL"
 
-# ─── Step 5: Scheduled Backfill ────────────────────────────
+# ─── Step 5: Scheduled Jobs ───────────────────────────────
 PLIST_SRC="$REPO_DIR/config/com.claude.session-search-backfill.plist"
 PLIST_DST="$HOME/Library/LaunchAgents/com.claude.session-search-backfill.plist"
+SWEEP_PLIST_SRC="$REPO_DIR/config/com.claude.session-search-sweep.plist"
+SWEEP_PLIST_DST="$HOME/Library/LaunchAgents/com.claude.session-search-sweep.plist"
 
 $_UI_IS_TTY && printf '%b' "$_CL"
-inst_step_active "Scheduler" "registering weekly backfill..."
+inst_step_active "Scheduler" "registering scheduled jobs..."
 
+SCHED_DETAIL=""
 if [ -f "$PLIST_SRC" ]; then
-    # Unload old version if exists
     launchctl unload "$PLIST_DST" 2>/dev/null || true
     cp "$PLIST_SRC" "$PLIST_DST"
     launchctl load "$PLIST_DST" 2>/dev/null || true
-    inst_step_replace "Scheduler" "weekly backfill registered"
+    SCHED_DETAIL="backfill"
+fi
+
+if [ -f "$SWEEP_PLIST_SRC" ]; then
+    launchctl unload "$SWEEP_PLIST_DST" 2>/dev/null || true
+    cp "$SWEEP_PLIST_SRC" "$SWEEP_PLIST_DST"
+    launchctl load "$SWEEP_PLIST_DST" 2>/dev/null || true
+    [ -n "$SCHED_DETAIL" ] && SCHED_DETAIL="$SCHED_DETAIL + "
+    SCHED_DETAIL="${SCHED_DETAIL}sweep (60s)"
+fi
+
+if [ -n "$SCHED_DETAIL" ]; then
+    inst_step_replace "Scheduler" "$SCHED_DETAIL registered"
 else
     inst_step_replace "Scheduler" "plist not found, skipped"
 fi

@@ -26,27 +26,30 @@ import math
 import os
 import re
 import shutil
+import signal
 import sqlite3
 import sys
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+signal.signal(signal.SIGPIPE, signal.SIG_DFL)
+
 DB_PATH = Path.home() / ".claude" / "session-index.db"
 CACHE_PATH = Path.home() / ".claude" / ".last-search-results.json"
 
 # ─── Stopwords ───────────────────────────────────────────
 
-STOP_WORDS = {
+STOP_WORDS = frozenset({
     "the", "a", "an", "is", "are", "was", "were", "and", "or", "but",
     "in", "on", "at", "to", "for", "of", "with", "by", "it", "its",
     "i", "we", "my", "our", "that", "this", "those", "these",
     "session", "claude", "where", "which", "how", "when", "what",
     "did", "do", "does", "have", "has", "had", "can", "could",
     "about", "just", "some", "any", "all", "also", "there", "here",
-}
+})
 # Keep domain-relevant words even if commonly stop-word-like
-KEEP_WORDS = {"not", "without", "no", "from", "after", "before", "during"}
+KEEP_WORDS = frozenset({"not", "without", "no", "from", "after", "before", "during"})
 # Short function words that add noise when split from hyphenated compounds
 # e.g. "slide-out" → keep "slide", drop "out"; "check-in" → keep "check", drop "in"
 # These are already in STOP_WORDS or are noise only as hyphen fragments
@@ -211,12 +214,12 @@ def build_fts5_query(tokens):
 
 # ─── Recency Boost ───────────────────────────────────────
 
-def recency_score(created_at_str):
-    """Calculate recency multiplier: more recent = higher score."""
+def recency_score(created_at_str, half_life_days=30, amplitude=0.3):
+    """Gaussian recency: gentle tiebreaker, not dominant signal."""
     try:
         created = datetime.fromisoformat(created_at_str.replace("Z", "+00:00"))
         days_old = max(0, (datetime.now(timezone.utc) - created).days)
-        return 1 + math.exp(-0.05 * days_old)
+        return 1.0 + amplitude * math.exp(-0.5 * (days_old / half_life_days) ** 2)
     except Exception:
         return 1.0
 
@@ -232,6 +235,11 @@ class QueryPipeline:
         if self.conn is None:
             self.conn = sqlite3.connect(str(self.db_path), timeout=5)
             self.conn.row_factory = sqlite3.Row
+            self.conn.execute("PRAGMA journal_mode=WAL")
+            self.conn.execute("PRAGMA synchronous=NORMAL")
+            self.conn.execute("PRAGMA cache_size=-65536")
+            self.conn.execute("PRAGMA mmap_size=268435456")
+            self.conn.execute("PRAGMA temp_store=MEMORY")
         return self.conn
 
     def _check_index_freshness(self):
@@ -398,12 +406,39 @@ class QueryPipeline:
                 results = self._reciprocal_rank_fusion([results, llm_results])[:limit * 2]
                 self._last_strategy = getattr(self, '_last_strategy', 'none') + " + LLM expansion"
 
-        # 7. Apply recency boost + depth multiplier and sort
-        for r in results:
-            r["recency"] = recency_score(r["created_at"])
-            msgs = max(r["message_count"], 1)
-            r["depth"] = max(0.3, min(3.0, math.log2(msgs + 1) / math.log2(6)))
-            r["final_score"] = r.get("bm25", 0) * r["recency"] * r["depth"]
+        # 7. Normalize BM25 scores and apply additive scoring
+        if results:
+            bm25_scores = [abs(r.get("bm25", 0)) for r in results]
+            min_bm25, max_bm25 = min(bm25_scores), max(bm25_scores)
+            bm25_range = max_bm25 - min_bm25 if max_bm25 != min_bm25 else 1.0
+
+            for r in results:
+                # Normalize BM25 to [0, 1]
+                norm_bm25 = (abs(r.get("bm25", 0)) - min_bm25) / bm25_range
+
+                # Recency: Gaussian decay, [1.0, 1.3]
+                recency = recency_score(r["created_at"])
+                norm_recency = (recency - 1.0) / 0.3  # normalize to [0, 1]
+
+                # Depth: sweet spot 10-100 messages, diminishing after 200
+                msgs = max(r["message_count"], 1)
+                if msgs < 5:
+                    depth = 0.5 + 0.1 * msgs
+                elif msgs <= 200:
+                    depth = 1.0 + 0.3 * math.log10(msgs / 5)
+                else:
+                    depth = 1.48 - 0.1 * math.log10(msgs / 200)
+                norm_depth = min(1.0, (depth - 0.5) / 1.0)
+
+                # Additive final score
+                r["recency"] = recency  # keep for display
+                r["depth"] = depth
+                r["final_score"] = (
+                    0.60 * norm_bm25
+                    + 0.15 * norm_recency
+                    + 0.10 * norm_depth
+                    + 0.15 * norm_bm25 * norm_recency  # interaction term: relevant + recent
+                )
         results.sort(key=lambda r: r["final_score"], reverse=True)
 
         # 8. Post-filter by #tag (must appear in tags column, case-insensitive)
@@ -478,13 +513,13 @@ class QueryPipeline:
         conn = self._connect()
         # Standalone FTS5 table — join on session_id column
         # BM25 weights (10 columns):
-        #   session_id(0), summary(10), first_prompt(1.5), tags(5), keywords(3),
-        #   project_name(0.5), context_text(2), assistant_text(3), files_changed(4), commands_run(2)
+        #   session_id(0), summary(12), first_prompt(3), tags(5), keywords(3),
+        #   project_name(0.5), context_text(2.5), assistant_text(1.5), files_changed(3.5), commands_run(1)
         sql = """
             SELECT s.session_id, s.project_path, s.project_name, s.summary,
                    s.first_prompt, s.context_text, s.git_branch, s.created_at,
                    s.modified_at, s.message_count, s.tags, s.keywords, s.source,
-                   bm25(sessions_fts, 0.0, 10.0, 1.5, 5.0, 3.0, 0.5, 2.0, 4.5, 2.5, 2.0) AS bm25_score,
+                   bm25(sessions_fts, 0.0, 12.0, 3.0, 5.0, 3.0, 0.5, 2.5, 1.5, 3.5, 1.0) AS bm25_score,
                    highlight(sessions_fts, 1, '\x02', '\x03') AS summary_hl,
                    highlight(sessions_fts, 6, '\x02', '\x03') AS context_hl,
                    highlight(sessions_fts, 7, '\x02', '\x03') AS assistant_hl

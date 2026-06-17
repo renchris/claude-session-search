@@ -4,6 +4,9 @@ name: Demo GIF
 # Fires only when the demo's inputs change (or on manual dispatch), then
 # commits the refreshed GIF back. Rendered from synthetic data — never the
 # real index. To regenerate locally instead: ./assets/demo/build.sh
+#
+# VHS + deps are installed directly (not charmbracelet/vhs-action, whose
+# bundled ffmpeg install fails on the runner).
 on:
   workflow_dispatch:
   push:
@@ -26,8 +29,27 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
-      - name: Install fzf
-        run: sudo apt-get update && sudo apt-get install -y fzf
+      - name: Install VHS and dependencies
+        run: |
+          set -eux
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg ttyd fzf sqlite3 unzip
+          # JetBrains Mono — VHS's default font, so CI renders match local
+          curl -fsSL -o /tmp/jbm.zip \
+            https://github.com/JetBrains/JetBrainsMono/releases/download/v2.304/JetBrainsMono-2.304.zip
+          sudo mkdir -p /usr/share/fonts/truetype/jetbrains-mono
+          sudo unzip -o -q /tmp/jbm.zip 'fonts/ttf/*' -d /tmp/jbm
+          sudo cp /tmp/jbm/fonts/ttf/*.ttf /usr/share/fonts/truetype/jetbrains-mono/
+          sudo fc-cache -f
+          # VHS from the official Charm apt repository
+          sudo mkdir -p /etc/apt/keyrings
+          curl -fsSL https://repo.charm.sh/apt/gpg.key \
+            | sudo gpg --dearmor -o /etc/apt/keyrings/charm.gpg
+          echo "deb [signed-by=/etc/apt/keyrings/charm.gpg] https://repo.charm.sh/apt/ * *" \
+            | sudo tee /etc/apt/sources.list.d/charm.list
+          sudo apt-get update
+          sudo apt-get install -y vhs
+          vhs --version
 
       - name: Bootstrap synthetic demo index (no private data)
         run: |
@@ -36,9 +58,7 @@ jobs:
           python3 assets/demo/build_demo_db.py /tmp/claude-search-demo-home/.claude/session-index.db
 
       - name: Render GIF with VHS
-        uses: charmbracelet/vhs-action@v2
-        with:
-          path: assets/demo/fzf-demo.tape
+        run: vhs assets/demo/fzf-demo.tape
 
       - name: Commit refreshed GIF if it changed
         run: |

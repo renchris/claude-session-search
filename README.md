@@ -34,6 +34,8 @@ $ claude-search "rum latency"
 
 > Notice `rum` matched sessions about *monitoring* and *CloudWatch* — the query expanded through a synonym table before it ever hit the index. [See how](#see-exactly-why-every-result-ranked-where-it-did)
 
+**Everything stays on your machine.** Your sessions and the search index never leave it — the only network call is the optional Haiku tagging and query-expansion, and only when you set your own `ANTHROPIC_API_KEY`.
+
 ---
 
 ## Why this exists

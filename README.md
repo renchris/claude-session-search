@@ -33,7 +33,7 @@ $ claude-search "rum latency"
   ╰──────────────────────────────────────────────────────────────────────╯
 ```
 
-> Notice `rum` matched sessions about *monitoring* and *CloudWatch* — the query expanded through a synonym table before it ever hit the index. [See how ↓](#see-exactly-why-every-result-ranked-where-it-did)
+> Notice `rum` matched sessions about *monitoring* and *CloudWatch* — the query expanded through a synonym table before it ever hit the index. [See how](#see-exactly-why-every-result-ranked-where-it-did)
 
 ---
 
@@ -310,14 +310,14 @@ $ claude-search --analytics
 
 No optional dependency is load-bearing. Remove any one and search still works — just with one fewer enhancement.
 
-| If this is unavailable | Fallback | Search still works? |
-|---|---|:--:|
-| Haiku API key | Regex-only tagging | ✅ tags less precise |
-| `rapidfuzz` | Skip fuzzy correction | ✅ synonyms cover most typos |
-| `anthropic` SDK | Raw HTTP, or skip LLM expansion | ✅ |
-| `sessions-index.json` | Rebuild from transcripts + `history.jsonl` | ✅ less metadata |
-| `fzf` | Plain ranked text output | ✅ no interactive picker |
-| `yake` | Simpler keyword extraction | ✅ |
+| If this is unavailable | Fallback | What you lose |
+|---|---|---|
+| Haiku API key | Regex-only tagging | Slightly less precise tags |
+| `rapidfuzz` | Skip fuzzy correction | Typo tolerance (synonyms still cover most) |
+| `anthropic` SDK | Raw HTTP, or skip LLM expansion | Nothing, or the LLM query fallback |
+| `sessions-index.json` | Rebuild from transcripts + `history.jsonl` | Some per-session metadata |
+| `fzf` | Plain ranked text output | The interactive picker |
+| `yake` | Simpler keyword extraction | Multi-word key phrases |
 
 ---
 

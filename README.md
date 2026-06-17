@@ -5,8 +5,6 @@
 **Find any past Claude Code session in milliseconds — full-text search across every project, ranked like a search engine.**
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-d4af37?style=flat-square)](LICENSE)
-[![Platform](https://img.shields.io/badge/Platform-macOS%20%7C%20Linux-7c3aed?style=flat-square)](#install-in-one-command)
-[![Stack](https://img.shields.io/badge/Stack-Bash%20%2B%20Python%20%2B%20SQLite%20FTS5-22c55e?style=flat-square)](#the-index-maintains-itself)
 [![Search latency](https://img.shields.io/badge/Search-%3C5ms-d4af37?style=flat-square)](#measure-and-tune-your-own-search)
 
 [Why it exists](#why-this-exists) · [Install](#install-in-one-command) · [Search](#search-by-keyword-date-project-or-tag) · [Resume](#resume-the-right-session-with-one-keystroke) · [Ranking](#see-exactly-why-every-result-ranked-where-it-did) · [Architecture](#the-index-maintains-itself)
@@ -127,6 +125,10 @@ claude-search --json "floor plan"           # JSON output for scripting
 ```bash
 claude-search --fzf "migration"
 ```
+
+<p align="center">
+  <img src="assets/fzf-demo.gif" alt="The claude-search fzf picker: typing a query narrows the ranked results live while the right-hand preview pane updates per selection, ending with Enter to resume the chosen session." width="840">
+</p>
 
 Pipes ranked results into an [`fzf`](https://github.com/junegunn/fzf) picker with a live preview pane that re-searches as you type:
 

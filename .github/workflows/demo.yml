@@ -1,0 +1,53 @@
+name: Demo GIF
+
+# Regenerate assets/fzf-demo.gif so it can't silently drift from the tool.
+# Fires only when the demo's inputs change (or on manual dispatch), then
+# commits the refreshed GIF back. Rendered from synthetic data — never the
+# real index. To regenerate locally instead: ./assets/demo/build.sh
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - bin/claude-search
+      - bin/session-search.py
+      - assets/demo/**
+
+permissions:
+  contents: write
+
+concurrency:
+  group: demo-gif
+  cancel-in-progress: true
+
+jobs:
+  regenerate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install fzf
+        run: sudo apt-get update && sudo apt-get install -y fzf
+
+      - name: Bootstrap synthetic demo index (no private data)
+        run: |
+          mkdir -p /tmp/claude-search-demo-home/.claude/bin
+          cp bin/session-search.py bin/claude-search /tmp/claude-search-demo-home/.claude/bin/
+          python3 assets/demo/build_demo_db.py /tmp/claude-search-demo-home/.claude/session-index.db
+
+      - name: Render GIF with VHS
+        uses: charmbracelet/vhs-action@v2
+        with:
+          path: assets/demo/fzf-demo.tape
+
+      - name: Commit refreshed GIF if it changed
+        run: |
+          if [ -n "$(git status --porcelain assets/fzf-demo.gif)" ]; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add assets/fzf-demo.gif
+            git commit -m "chore: regenerate fzf demo GIF [skip ci]"
+            git push
+          else
+            echo "GIF unchanged — nothing to commit."
+          fi

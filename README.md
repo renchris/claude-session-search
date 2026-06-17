@@ -4,6 +4,7 @@
 
 **Find any past Claude Code session in milliseconds — full-text search across every project, ranked like a search engine.**
 
+[![CI](https://github.com/renchris/claude-session-search/actions/workflows/ci.yml/badge.svg)](https://github.com/renchris/claude-session-search/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-d4af37?style=flat-square)](LICENSE)
 [![Search latency](https://img.shields.io/badge/Search-%3C5ms-d4af37?style=flat-square)](#measure-and-tune-your-own-search)
 

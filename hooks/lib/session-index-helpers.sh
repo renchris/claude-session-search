@@ -582,6 +582,80 @@ except MemoryError:
 " 2>/dev/null || printf '\t\t'
 }
 
+# ─── Workflow result extraction ────────────────────────────
+# A Dynamic Workflow writes its result to `<project>/<sid>/workflows/wf_*.json`, and nothing else
+# records it: a finding that lived only there was invisible to claude-search.
+# ONE python3 per changed file, printing TWO lines and nothing else:
+#   line 1  first_prompt   `workflow <name>: <summary head>`, ≤500 chars
+#   line 2  context_text   workflowName + summary + phase titles/details + every string in `result`
+# Never `script` (the JS source) or `logs`. Newlines are the separator, not tabs, so an empty
+# field cannot shift its neighbour (the TSV collapse). Prints nothing for a file it cannot read as
+# a workflow object, which the caller treats as "track it, index nothing".
+session_index_extract_workflow() {
+    local wf_path="$1"
+    local max_chars="${2:-${SESSION_INDEX_WF_MAX_CHARS:-32000}}"
+    [ -f "$wf_path" ] || return 0
+
+    local file_size
+    file_size=$(stat -f%z "$wf_path" 2>/dev/null || stat -c%s "$wf_path" 2>/dev/null || echo 0)
+    if [ "$file_size" -gt 52428800 ]; then
+        session_index_log "Skipping large workflow file ($file_size bytes): $wf_path"
+        return 0
+    fi
+
+    WF_PATH="$wf_path" WF_MAX_CHARS="$max_chars" python3 - <<'WF_PY' 2>/dev/null || true
+import json
+import os
+import sys
+from typing import Any
+
+
+def flat(s: str) -> str:
+    return " ".join(s.split())
+
+
+def walk(node: Any, out: list[str], budget: list[int]) -> None:
+    if budget[0] <= 0:
+        return
+    if isinstance(node, str):
+        s = flat(node)
+        if s:
+            out.append(s)
+            budget[0] -= len(s) + 1
+    elif isinstance(node, dict):
+        for v in node.values():
+            walk(v, out, budget)
+    elif isinstance(node, list):
+        for v in node:
+            walk(v, out, budget)
+
+
+max_chars = int(os.environ["WF_MAX_CHARS"])
+try:
+    with open(os.environ["WF_PATH"], encoding="utf-8", errors="replace") as fh:
+        d = json.load(fh)
+except (OSError, ValueError, MemoryError):
+    sys.exit(0)
+if not isinstance(d, dict):
+    sys.exit(0)
+
+name = flat(str(d.get("workflowName") or ""))
+summary = flat(str(d.get("summary") or ""))
+parts: list[str] = [p for p in (name, summary) if p]
+for ph in d.get("phases") or []:
+    if isinstance(ph, dict):
+        for k in ("title", "detail"):
+            v = ph.get(k)
+            if isinstance(v, str) and v.strip():
+                parts.append(flat(v))
+budget = [max_chars]
+walk(d.get("result"), parts, budget)
+
+head = f"workflow {name or '?'}: {summary}"[:500]
+sys.stdout.write(head + "\n" + " ".join(parts)[:max_chars] + "\n")
+WF_PY
+}
+
 # ─── Stats ─────────────────────────────────────────────────
 
 session_index_stats() {

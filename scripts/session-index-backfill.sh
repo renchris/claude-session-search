@@ -521,6 +521,47 @@ SQL
     ui_phase_done "Phase 4: Transcript enrichment" "$_p4_summary" "$_p4_start"
 fi
 
+# ─── Phase 4b: Workflow result files ──────────────────────
+# A Dynamic Workflow's result lives only in {project_dir}/{session_id}/workflows/wf_*.json.
+# Each becomes its OWN row keyed on the file stem (`wf_…`), with the same rules as the sweep:
+# source 'workflow-sweep', the parent's project, never the parent's row. Phase 6 rebuilds FTS.
+
+_p4b_start=$(_ui_now)
+phase4b_indexed=0
+phase4b_bad=0
+for project_dir in "$CLAUDE_PROJECTS_DIR"/*/; do
+    dir_name=$(basename "$project_dir")
+    proj_path=$(echo "$dir_name" | sed 's/^-/\//' | sed 's/-/\//g')
+    proj_name=$(session_index_project_name "$proj_path")
+    for wf in "$project_dir"*/workflows/wf_*.json; do
+        [ -f "$wf" ] || continue
+        if [ -n "$SINCE_DAYS" ]; then
+            file_epoch=$(stat -f "%m" "$wf" 2>/dev/null || echo 0)
+            [ "$file_epoch" -lt "$SINCE_EPOCH" ] && continue
+        fi
+        extracted=$(session_index_extract_workflow "$wf" 2>/dev/null || true)
+        wf_head=""; wf_text=""
+        { IFS= read -r wf_head || true; IFS= read -r wf_text || true; } <<< "$extracted"
+        if [ -z "$wf_text" ]; then
+            phase4b_bad=$((phase4b_bad + 1))
+            continue
+        fi
+        now=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+        file_mtime=$(stat -f "%Sm" -t "%Y-%m-%dT%H:%M:%SZ" "$wf" 2>/dev/null || echo "$now")
+        keywords=$(session_index_extract_keywords "$wf_head $wf_text" 2>/dev/null || echo "")
+        session_index_upsert "$(basename "$wf" .json)" "$proj_path" "$proj_name" "" "$wf_head" "" \
+            "$file_mtime" "$file_mtime" 0 "" "$keywords" "workflow-sweep" "$wf_text" "" "" "" ""
+        phase4b_indexed=$((phase4b_indexed + 1))
+    done
+done
+if [ "$phase4b_indexed" -eq 0 ] && [ "$phase4b_bad" -eq 0 ]; then
+    ui_phase_skip "Phase 4b: Workflow results" "no workflow files"
+else
+    _p4b_summary="$phase4b_indexed indexed"
+    [ "$phase4b_bad" -gt 0 ] && _p4b_summary="$_p4b_summary, $phase4b_bad unreadable"
+    ui_phase_done "Phase 4b: Workflow results" "$_p4b_summary" "$_p4b_start"
+fi
+
 # ─── Phase 5: DB-driven enrichment gap-fill ───────────────
 # Queries sessions with empty assistant_text, locates their transcript,
 # and populates assistant_text, files_changed, commands_run.
@@ -535,7 +576,7 @@ phase5_nofound=0
 
 # Query sessions missing assistant_text
 _p5_total=$(sqlite3 "$SESSION_INDEX_DB" \
-    "SELECT COUNT(*) FROM sessions WHERE assistant_text = '' AND session_id NOT LIKE 'legacy-%' $SINCE_FILTER;" \
+    "SELECT COUNT(*) FROM sessions WHERE assistant_text = '' AND session_id NOT LIKE 'legacy-%' AND session_id NOT LIKE 'wf\_%' ESCAPE '\' $SINCE_FILTER;" \
     2>/dev/null || echo 0)
 
 if [ "$_p5_total" -eq 0 ]; then
@@ -547,7 +588,7 @@ else
     # Dump session_id + project_path pairs to temp file
     _P5_TMP=$(mktemp)
     sqlite3 -separator $'\t' "$SESSION_INDEX_DB" \
-        "SELECT session_id, project_path FROM sessions WHERE assistant_text = '' AND session_id NOT LIKE 'legacy-%' $SINCE_FILTER;" \
+        "SELECT session_id, project_path FROM sessions WHERE assistant_text = '' AND session_id NOT LIKE 'legacy-%' AND session_id NOT LIKE 'wf\_%' ESCAPE '\' $SINCE_FILTER;" \
         > "$_P5_TMP" 2>/dev/null || true
 
     while IFS=$'\t' read -r sid proj_path; do

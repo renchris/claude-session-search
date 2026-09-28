@@ -139,6 +139,11 @@ if $FZF_MODE; then
     if [ -n "$SELECTED" ]; then
         # Extract session_id (last tab-separated field)
         SESSION_ID=$(echo "$SELECTED" | awk -F'\t' '{print $NF}' | tr -d '[:space:]')
+        # A workflow result (wf_…) is a file, not a session: show it instead of resuming.
+        if [[ "$SESSION_ID" == wf_* ]]; then
+            python3 "$SEARCH_PY" --preview "$SESSION_ID"
+            exit 0
+        fi
         if [ -n "$SESSION_ID" ]; then
             echo "Resuming session: $SESSION_ID"
             exec claude --resume "$SESSION_ID"

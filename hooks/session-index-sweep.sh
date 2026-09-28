@@ -202,6 +202,56 @@ SQL
 
         WORK_DONE=$((WORK_DONE + 1))
     done
+
+    # ─── Workflow results: {project_dir}/{session_id}/workflows/wf_*.json ──
+    # Each is its OWN row keyed on the file stem (`wf_…`); the parent session's row is never
+    # touched. A file that is not a readable workflow object is still tracked, so an unchanged
+    # bad file is not re-parsed every tick.
+    for wf in "$project_dir"*/workflows/wf_*.json; do
+        [ -f "$wf" ] || continue
+        sid=$(basename "$wf" .json)
+
+        file_mtime=$(stat -f "%m" "$wf" 2>/dev/null || echo 0)
+        file_size=$(stat -f "%z" "$wf" 2>/dev/null || echo 0)
+        wf_escaped=$(echo "$wf" | sed "s/'/''/g")
+        tracked=$(session_index_sql "SELECT last_mtime, last_size FROM file_tracking WHERE file_path = '$wf_escaped' LIMIT 1;" 2>/dev/null || echo "")
+        if [ -n "$tracked" ]; then
+            IFS='|' read -r tracked_mtime tracked_size <<< "$tracked"
+            if [ "$file_mtime" = "$tracked_mtime" ] && [ "$file_size" = "$tracked_size" ]; then
+                continue
+            fi
+        fi
+
+        extracted=$(session_index_extract_workflow "$wf" 2>/dev/null || true)
+        wf_head=""; wf_text=""
+        { IFS= read -r wf_head || true; IFS= read -r wf_text || true; } <<< "$extracted"
+
+        sid_escaped=$(echo "$sid" | sed "s/'/''/g")
+        if [ -n "$wf_text" ]; then
+            keywords=$(session_index_extract_keywords "$wf_head $wf_text" 2>/dev/null || echo "")
+            file_mtime_iso=$(date -r "$file_mtime" -u +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null || echo "$NOW")
+            session_index_upsert_with_fts \
+                "$sid" "$proj_path" "$proj_name" "" "$wf_head" "" \
+                "$file_mtime_iso" "$file_mtime_iso" 0 "" "$keywords" \
+                "workflow-sweep" "$wf_text" "" "" "" ""
+            session_index_sql "UPDATE sessions SET sweep_mtime = $file_mtime, sweep_size = $file_size WHERE session_id = '$sid_escaped';"
+        else
+            session_index_log "Workflow file not indexed (unreadable or empty): $wf"
+        fi
+
+        proj_dir_escaped=$(echo "$project_dir" | sed "s/'/''/g")
+        session_index_sql <<SQL
+INSERT INTO file_tracking (file_path, session_id, project_dir, last_mtime, last_size, last_swept_at, sweep_count, is_active)
+VALUES ('$wf_escaped', '$sid_escaped', '$proj_dir_escaped', $file_mtime, $file_size, '$NOW', 1, 1)
+ON CONFLICT(file_path) DO UPDATE SET
+    last_mtime = $file_mtime,
+    last_size = $file_size,
+    last_swept_at = '$NOW',
+    sweep_count = file_tracking.sweep_count + 1;
+SQL
+
+        WORK_DONE=$((WORK_DONE + 1))
+    done
 done
 
 # ─── Log only when work was done ──────────────────────────

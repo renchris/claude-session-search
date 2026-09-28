@@ -32,6 +32,7 @@ import sys
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import Optional
 
 signal.signal(signal.SIGPIPE, signal.SIG_DFL)
 
@@ -1587,6 +1588,11 @@ def format_table(results, elapsed_ms=0, pipeline=None, raw_query=None, explain=F
                 rendered = snip_text.replace("\x02", HL_SNIPPET_ON).replace("\x03", HL_SNIPPET_OFF)
                 print(f"  {' ' * GUTTER}{GRAY}{THIN_V} {rendered}{R}")
 
+        # A workflow result is a file, not a resumable session: show where it is.
+        wf_path = workflow_result_path(sid)
+        if wf_path:
+            print(f"  {' ' * GUTTER}{GRAY}{THIN_V} workflow result: {wf_path}{R}")
+
         # Show chunk context indicator if result came from deep search
         if r.get("chunk_context"):
             chunk_info = r["chunk_context"]
@@ -1625,7 +1631,37 @@ def format_fzf(results):
 
 
 def format_json(results):
+    for r in results:
+        wf = workflow_result_path(r.get("session_id", ""))
+        if wf:
+            r["workflow_path"] = wf
     print(json.dumps(results, indent=2, default=str))
+
+
+def workflow_result_path(session_id: str) -> Optional[str]:
+    """JSON path of a workflow result row (`wf_…`), or None for an ordinary session.
+
+    A workflow result is indexed as its own row but is not a Claude session, so it cannot be
+    resumed: the file itself is what a hit points at. The sweep records it in file_tracking.
+    """
+    if not session_id.startswith("wf_"):
+        return None
+    try:
+        conn = sqlite3.connect(f"file:{DB_PATH}?mode=ro", uri=True)
+        try:
+            row = conn.execute(
+                "SELECT file_path FROM file_tracking WHERE session_id = ? LIMIT 1", (session_id,)
+            ).fetchone()
+        finally:
+            conn.close()
+        if row and row[0]:
+            return str(row[0])
+    except sqlite3.Error:
+        pass
+    for cfg in sorted(Path.home().glob(".claude*/projects")):
+        for hit in cfg.glob(f"*/*/workflows/{session_id}.json"):
+            return str(hit)
+    return None
 
 
 def _extract_last_messages(session_id, project_path, count=3):
@@ -1702,6 +1738,10 @@ def format_preview(session):
     if session.get("tags"):
         tags_display = ", ".join(t.strip() for t in session['tags'].split(',')[:5])
         print(f"\033[2;35m{tags_display}\033[0m")
+
+    wf_path = workflow_result_path(session["session_id"])
+    if wf_path:
+        print(f"\033[1;36mWorkflow result\033[0m (not a resumable session): {wf_path}")
 
     # ─── Description (no pre-wrapping — let fzf handle it) ─
     desc = _build_description(session)
@@ -1871,6 +1911,10 @@ def main():
             sid = results[n - 1]["session_id"]
             if sid.startswith("legacy-"):
                 print(f"Result #{n} is a legacy session and cannot be resumed.", file=sys.stderr)
+                sys.exit(1)
+            wf_path = workflow_result_path(sid)
+            if wf_path or sid.startswith("wf_"):
+                print(f"Result #{n} is a workflow result, not a session: {wf_path or sid}", file=sys.stderr)
                 sys.exit(1)
             # Output the session ID for the bash wrapper to exec
             print(sid)

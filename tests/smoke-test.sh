@@ -56,7 +56,7 @@ echo ""
 echo "Search CLI:"
 check "session-search.py exists" test -f "$SEARCH_PY"
 check "Stats mode" python3 "$SEARCH_PY" --stats
-check "Search returns results" python3 "$SEARCH_PY" --format=json "session" --limit 1
+check "Search returns JSON" bash -c "python3 '$SEARCH_PY' --json session --limit 1 | jq -e '.sessions|length==1'"
 
 # 4. SessionEnd hook test
 echo ""

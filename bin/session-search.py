@@ -4,9 +4,12 @@ Claude Session Search Engine — Full-text search over session index.
 
 Usage:
     session-search.py "query"                    # Search, show ranked results
+    session-search.py --json "query"             # One JSON document: {"sessions": [...], ...}
     session-search.py --format=fzf "query"       # fzf-compatible output
-    session-search.py --format=json "query"      # JSON output
-    session-search.py --after 2026-03-01 "query"  # Date filter
+    session-search.py --format=json "query"      # Deprecated: use --json. Prints a bare JSON array
+    session-search.py --since 2026-03-01 "query"  # Date filter: ISO 8601 or relative (7d, 12h)
+    session-search.py --until 2026-04-01 "query"  # Same forms as --since
+    session-search.py --no-llm "query"           # Never send the query to the Anthropic API
     session-search.py --project "reso" "query"   # Project filter
     session-search.py "@reso bottle service"     # Inline @project shortcut
     session-search.py "#auth debugging"          # Inline #tag filter
@@ -2364,6 +2367,49 @@ def format_json(results):
     print(json.dumps(results, indent=2, default=str))
 
 
+_SESSION_FIELDS = (
+    "session_id",
+    "project_name",
+    "project_path",
+    "git_branch",
+    "created_at",
+    "modified_at",
+    "message_count",
+    "summary",
+)
+_HIGHLIGHT_MARKS = str.maketrans("", "", "\x02\x03")
+
+
+def _without_marks(value: Any) -> Any:
+    return value.translate(_HIGHLIGHT_MARKS) if isinstance(value, str) else value
+
+
+def public_session(row: Mapping[str, Any]) -> dict[str, Any]:
+    """A session's fixed fields in a --json document, whichever query produced the row."""
+    session = {field: _without_marks(row.get(field)) for field in _SESSION_FIELDS}
+    tags = _without_marks(row.get("tags")) or ""
+    session["tags"] = [tag.strip() for tag in tags.split(",") if tag.strip()]
+    session["workflow_path"] = workflow_result_path(row.get("session_id") or "")
+    return session
+
+
+def public_result(r: Mapping[str, Any], rank: int) -> dict[str, Any]:
+    return {"rank": rank, **public_session(r), "score": r.get("final_score")}
+
+
+def _resolved_line(pipeline: "QueryPipeline", row: Mapping[str, Any], n: int) -> str:
+    sid = row["session_id"]
+    # The result cache holds no project, and this line must not cost the caller its resume.
+    if "project_name" not in row:
+        try:
+            row = pipeline.preview(sid) or row
+        except sqlite3.Error:
+            pass
+    summary = " ".join(str(row.get("summary") or row.get("first_prompt") or "(no summary)").split())
+    project = row.get("project_name") or "unknown project"
+    return sanitize_display(f"Resolved #{n}: {summary[:80]} ({project}, {sid})")
+
+
 def workflow_result_path(session_id: str) -> Optional[str]:
     """JSON path of a workflow result row (`wf_…`), or None for an ordinary session.
 
@@ -2447,10 +2493,6 @@ def _extract_last_messages(session_id, project_path, count=3):
 
 
 def format_preview(session):
-    if not session:
-        print("Session not found.")
-        return
-
     # ─── Compact metadata header ─────────────────────────
     age = format_relative_time(session['created_at'], compact=True)
     msgs = session['message_count']
@@ -2535,14 +2577,21 @@ def main():
     validate_args(parser, args)
 
     if not DB_PATH.exists():
-        print("No index database found. Run session-index-backfill.sh first.", file=sys.stderr)
-        sys.exit(1)
+        raise CliError(
+            "Can't search: no index at ~/.claude/session-index.db.",
+            reason="not_found",
+            status="action_required",
+            recovery=(("Build it:", "~/.claude/bin/session-index-backfill.sh"),),
+        )
 
     pipeline = QueryPipeline()
 
     try:
         if args.stats:
             s = pipeline.stats()
+            if args.json:
+                emit_json({"stats": s})
+                return
             color = _use_color()
             R = "\033[0m" if color else ""
             BOLD = "\033[1m" if color else ""
@@ -2600,7 +2649,25 @@ def main():
 
         if args.preview:
             session = pipeline.preview(args.preview)
-            format_preview(session)
+            if session is None:
+                raise CliError(
+                    f"Couldn't find session {sanitize_display(args.preview)}.",
+                    reason="not_found",
+                    recovery=(("Find its ID:", 'claude-search "<QUERY>"'),),
+                )
+            if args.json:
+                emit_json(
+                    {
+                        "session": {
+                            **public_session(session),
+                            "first_prompt": _without_marks(session.get("first_prompt")),
+                        }
+                    }
+                )
+            elif args.format == "json":
+                print(json.dumps(session, default=str))
+            else:
+                format_preview(session)
             return
 
         query = " ".join(args.query)
@@ -2622,49 +2689,63 @@ def main():
                 results = _load_cached_results()
 
             if not results:
-                print("No results. Run a search first.", file=sys.stderr)
-                sys.exit(1)
-            if n < 1 or n > len(results):
-                print(f"Result #{n} out of range (1-{len(results)}).", file=sys.stderr)
-                sys.exit(1)
+                if query:
+                    raise CliError(f'No sessions match "{query}".', reason="not_found")
+                raise CliError(
+                    "No cached results to resume.",
+                    code=2,
+                    reason="missing_query",
+                    status="action_required",
+                    recovery=(
+                        ("Search first:", 'claude-search "<QUERY>"'),
+                        ("Then resume by number:", "claude-search --resume 1"),
+                    ),
+                )
+            if n > len(results):
+                raise CliError(
+                    f"Result #{n} is out of range: the last search returned "
+                    f"{plural(len(results), 'result')}.",
+                    code=2,
+                    reason="invalid_arguments",
+                    status="action_required",
+                    recovery=(("Pick one in range:", "claude-search --resume 1"),),
+                )
             sid = results[n - 1]["session_id"]
             if sid.startswith("legacy-"):
-                print(f"Result #{n} is a legacy session and cannot be resumed.", file=sys.stderr)
-                sys.exit(1)
+                raise CliError(
+                    f"Result #{n} is a legacy session and cannot be resumed.", reason="not_found"
+                )
             wf_path = workflow_result_path(sid)
             if wf_path or sid.startswith("wf_"):
-                print(f"Result #{n} is a workflow result, not a session: {wf_path or sid}", file=sys.stderr)
+                refusal = f"Result #{n} is a workflow result, not a session: {wf_path or sid}"
+                if args.json:
+                    raise CliError(refusal, reason="not_found")
+                # tests/workflow-index-test.sh compares this line exactly, so it takes no "Error:" prefix.
+                print(sanitize_display(refusal), file=sys.stderr)
                 sys.exit(1)
+            if args.json:
+                emit_json({"session": {"session_id": sid, "rank": n}})
+                return
+            print(_resolved_line(pipeline, results[n - 1], n), file=sys.stderr)
             # Output the session ID for the bash wrapper to exec
             print(sid)
             return
 
         if not query:
-            parser.print_help()
-            sys.exit(1)
-
-        # Show spinner while searching (cosmetic — search is <5ms)
-        is_tty = sys.stdout.isatty()
-        if is_tty and args.format == "table":
-            sys.stdout.write('  \033[2m\u280b Searching\u2026\033[0m')
-            sys.stdout.flush()
+            parser.error("missing search query")
 
         t0 = time.monotonic()
-        results = pipeline.search(
-            query,
-            limit=args.limit,
-            project_filter=args.project,
-            date_after=args.after,
-            date_before=args.before,
-            min_messages=args.min_msgs,
-            deep_search=args.deep_search,
-        )
+        with spinner("Searching…", MODE):
+            results = pipeline.search(
+                query,
+                limit=args.limit,
+                project_filter=args.project,
+                date_after=args.after,
+                date_before=args.before,
+                min_messages=args.min_msgs,
+                deep_search=args.deep_search,
+            )
         elapsed_ms = int((time.monotonic() - t0) * 1000)
-
-        # Clear spinner
-        if is_tty and args.format == "table":
-            sys.stdout.write('\r\033[K')
-            sys.stdout.flush()
 
         pipeline.log_search(query, len(results), pipeline_ms=elapsed_ms)
         _cache_results(results)
@@ -2672,7 +2753,14 @@ def main():
         # Reset dedup tracking before rendering
         pipeline.reset_dedup()
 
-        if args.format == "fzf":
+        if args.json:
+            emit_json(
+                {
+                    "sessions": [public_result(r, rank=i) for i, r in enumerate(results, 1)],
+                    "pagination": {"next": None},
+                }
+            )
+        elif args.format == "fzf":
             format_fzf(results)
         elif args.format == "json":
             format_json(results)

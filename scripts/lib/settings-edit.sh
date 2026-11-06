@@ -123,9 +123,11 @@ css_settings_patch() {
         printf '%s: no such file\n' "$file" >&2
         return 1
     fi
-    # mkdir because flock is absent on macOS. Another holder's lock is never removed here.
+    # A directory because flock is absent on macOS. os.mkdir, not the mkdir command: uutils mkdir
+    # (ubuntu-latest) exits 0 when it loses the race, so two holders would both proceed (measured).
+    # Another holder's lock is never removed here.
     lock="$target.lock.d"
-    until mkdir "$lock" 2>/dev/null; do
+    until python3 -I -c 'import os, sys; os.mkdir(sys.argv[1])' "$lock" 2>/dev/null; do
         tries=$((tries + 1))
         if [ "$tries" -ge "$_CSS_SETTINGS_LOCK_TRIES" ]; then
             printf '%s: another install holds the lock; if none is running: rmdir %s\n' "$target" "$lock" >&2

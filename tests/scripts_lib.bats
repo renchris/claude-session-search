@@ -288,7 +288,8 @@ COLOR='css_parse_args prog "no-color||bool|__SESSION_SEARCH_NO_COLOR" -- "$@"; i
 }
 
 @test "sourcing the libraries has no side effect and a patch keeps the caller's EXIT trap" {
-    run "$LIB" 'trap -p; echo sourced'
+    # Named signals only: a bare `trap -p` also lists what the runner already ignores (SIGPIPE on CI).
+    run "$LIB" 'trap -p EXIT INT TERM HUP; echo sourced'
     [ "$status" -eq 0 ]
     [ "$output" = sourced ]
     assert_tree_unchanged

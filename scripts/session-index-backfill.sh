@@ -1,47 +1,178 @@
 #!/bin/bash
 # One-time idempotent backfill of session index from all data sources.
-# Usage:
-#   session-index-backfill.sh                    # Full backfill
-#   session-index-backfill.sh --enrich-only      # Skip discovery, just re-extract enrichment
-#   session-index-backfill.sh --since 7          # Only sessions modified in last 7 days
-#   session-index-backfill.sh --enrich-only --since 3  # Re-enrich recent sessions only
+# Usage and options: session-index-backfill.sh --help
 set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-REPO_DIR="$(dirname "$SCRIPT_DIR")"
-source "$REPO_DIR/hooks/lib/session-index-helpers.sh"
-source "$SCRIPT_DIR/lib/progress-ui.sh"
+_backfill_usage() {
+    cat <<'USAGE'
+Usage: session-index-backfill.sh [options]
 
-QUIET=false
-ENRICH_ONLY=false
-SINCE_DAYS=""
+Build or refresh the session index from all data sources. Safe to run again.
 
-while [ $# -gt 0 ]; do
-    case "$1" in
-        --quiet) QUIET=true; shift ;;
-        --enrich-only) ENRICH_ONLY=true; shift ;;
-        --since) SINCE_DAYS="$2"; shift 2 ;;
-        *) echo "Unknown flag: $1" >&2; exit 1 ;;
+Options:
+  -s, --since <TIME>  Only sessions changed since TIME. Default: all history.
+                      TIME is whole days (1-36500), a relative value (7d, 12h)
+                      or ISO 8601 (2026-03-01). With no offset, a date is UTC.
+                      The last one given wins. An empty value is refused.
+      --enrich-only   Skip discovery and only re-extract enrichment.
+      --quiet         Accepted, with no effect: the output stays the same.
+  -h, --help          Show this help.
+
+Examples:
+  session-index-backfill.sh
+  session-index-backfill.sh --enrich-only
+  session-index-backfill.sh --since 7
+  session-index-backfill.sh --since 12h
+  session-index-backfill.sh --since 2026-03-01
+  session-index-backfill.sh --enrich-only --since 3
+
+Notes:
+  Needs sqlite3, jq and python3. Reads and writes ~/.claude.
+
+Exit codes:
+  0              Success.
+  1              Failure, including a missing prerequisite or file.
+  2              Usage error.
+  129, 130, 143  Stopped by HUP, INT or TERM.
+USAGE
+}
+
+# This scan runs before any source, so help needs no DB or library and wins over other validation.
+if [ "${1:-}" = help ]; then
+    _backfill_usage
+    exit 0
+fi
+_since_given=0
+for _arg in "$@"; do
+    case "$_arg" in
+        --) break ;;
+        -h | --help)
+            _backfill_usage
+            exit 0
+            ;;
+        # The parser leaves an empty value looking like no option at all.
+        -s | --since | --since=*) _since_given=1 ;;
     esac
 done
 
-# Build optional SQL filter for --since
-SINCE_FILTER=""
-SINCE_EPOCH=0
-if [ -n "$SINCE_DAYS" ]; then
-    SINCE_FILTER="AND modified_at > datetime('now', '-${SINCE_DAYS} days')"
-    # Compute epoch threshold for file mtime comparisons (macOS date)
-    SINCE_EPOCH=$(date -v-"${SINCE_DAYS}"d +%s 2>/dev/null || date -d "-${SINCE_DAYS} days" +%s 2>/dev/null || echo 0)
+# The name on PATH is a symlink into ~/.claude/bin, so follow the whole chain to find the repo.
+# A loop, because `readlink -f` is missing on older macOS.
+_self="$0"
+while [ -L "$_self" ]; do
+    _link="$(readlink "$_self")"
+    case "$_link" in
+        /*) _self="$_link" ;;
+        *) _self="$(dirname "$_self")/$_link" ;;
+    esac
+done
+SCRIPT_DIR="$(cd -P "$(dirname "$_self")" && pwd)"
+REPO_DIR="$(dirname "$SCRIPT_DIR")"
+
+_require_file() {
+    if [ ! -f "$1" ]; then
+        printf 'session-index-backfill: cannot find %s (resolved repo: %s). Re-run install.sh from the claude-session-search checkout.\n' \
+            "$1" "$REPO_DIR" >&2
+        exit 1
+    fi
+}
+
+_require_file "$SCRIPT_DIR/lib/cli-common.sh"
+# shellcheck disable=SC1091 # bare shellcheck does not follow sources
+source "$SCRIPT_DIR/lib/cli-common.sh"
+
+_PROG=session-index-backfill.sh
+_enrich_flag=0
+_since_value=""
+# Parse-only stops below instead, so that a help example with a bad --since fails too.
+__SESSION_SEARCH_PARSE_ONLY='' css_parse_args "$_PROG" \
+    "quiet||bool|_quiet_flag" \
+    "enrich-only||bool|_enrich_flag" \
+    "since|s|value|_since_value" \
+    "help|h|bool|_help_flag" \
+    -- "$@"
+ENRICH_ONLY=false
+if [ "$_enrich_flag" = 1 ]; then
+    ENRICH_ONLY=true
 fi
+
+_require_file "$REPO_DIR/hooks/lib/session-index-helpers.sh"
+_require_file "$SCRIPT_DIR/lib/progress-ui.sh"
+_require_file "$SCRIPT_DIR/lib/cli_common.py"
 
 # ─── Prerequisites ─────────────────────────────────────────
 
-if ! command -v sqlite3 &>/dev/null; then
-    echo "ERROR: sqlite3 not found" >&2; exit 1
+for _tool in sqlite3 jq python3; do
+    if ! command -v "$_tool" >/dev/null 2>&1; then
+        css_fail "$_tool not found" "Install $_tool, then run session-index-backfill.sh again."
+    fi
+done
+
+# ─── --since ───────────────────────────────────────────────
+# SINCE_DAYS is empty with no --since. Otherwise it is a whole number of days, rounded up, because
+# session-index-chunk.py takes that form and a wider window only chunks a superset. SINCE_EPOCH is
+# always an integer, which is what keeps SINCE_FILTER's SQL free of user input.
+
+_refuse_since() {
+    css_usage_fail "$_PROG" "invalid --since '$1': whole days 1-36500, a relative value (7d, 12h), or ISO 8601."
+}
+
+SINCE_DAYS=""
+SINCE_EPOCH=0
+SINCE_FILTER=""
+SINCE_LABEL=""
+if [ "$_since_given" = 1 ]; then
+    # parse-time alone takes 0h, 007 and 100000, so a count is bounded here.
+    _since_amount="${_since_value%[dhm]}"
+    case "$_since_amount" in
+        "" | *[!0-9]*) SINCE_LABEL="since $_since_value" ;;
+        0*) _refuse_since "$_since_value" ;;
+        *)
+            case "$_since_value" in
+                *[hm]) SINCE_LABEL="last $_since_value" ;;
+                *)
+                    if [ "${#_since_amount}" -gt 5 ] || [ "$_since_amount" -gt 36500 ]; then
+                        _refuse_since "$_since_value"
+                    fi
+                    SINCE_DAYS="$_since_amount"
+                    SINCE_LABEL="last ${_since_amount}d"
+                    ;;
+            esac
+            ;;
+    esac
+
+    _since_rc=0
+    SINCE_EPOCH="$(python3 "$SCRIPT_DIR/lib/cli_common.py" parse-time "$_since_value" --min-days 1 2>/dev/null)" || _since_rc=$?
+    if [ "$_since_rc" = 2 ]; then
+        _refuse_since "$_since_value"
+    fi
+    if [ "$_since_rc" != 0 ]; then
+        css_fail "could not read --since: cli_common.py exited $_since_rc" "Run it directly to see why" \
+            "python3 $SCRIPT_DIR/lib/cli_common.py parse-time 7"
+    fi
+    # --since=-h reaches argparse as its own help, which exits 0.
+    case "$SINCE_EPOCH" in
+        "" | *[!0-9-]*) _refuse_since "$_since_value" ;;
+    esac
+
+    if [ -z "$SINCE_DAYS" ]; then
+        SINCE_DAYS=$((($(date +%s) - SINCE_EPOCH + 86399) / 86400))
+        # chunk.py reads 0 as no cutoff, which a future date must not become. The ceiling reaches
+        # back past any file's mtime, and chunk.py overflows on a date near year 1.
+        if [ "$SINCE_DAYS" -lt 1 ]; then
+            SINCE_DAYS=1
+        elif [ "$SINCE_DAYS" -gt 36500 ]; then
+            SINCE_DAYS=36500
+        fi
+    fi
+    SINCE_FILTER="AND modified_at > datetime($SINCE_EPOCH,'unixepoch')"
 fi
-if ! command -v jq &>/dev/null; then
-    echo "ERROR: jq not found" >&2; exit 1
+
+if [ "${__SESSION_SEARCH_PARSE_ONLY:-}" = 1 ]; then
+    exit 0
 fi
+
+source "$REPO_DIR/hooks/lib/session-index-helpers.sh"
+source "$SCRIPT_DIR/lib/progress-ui.sh"
 
 # ─── Init DB ───────────────────────────────────────────────
 
@@ -83,7 +214,7 @@ done
 # ─── Header ────────────────────────────────────────────────
 
 if [ -n "$SINCE_DAYS" ]; then
-    _header_detail="last ${SINCE_DAYS}d  ${_existing_total} existing"
+    _header_detail="${SINCE_LABEL}  ${_existing_total} existing"
 else
     _header_detail="${_existing_total} existing"
 fi

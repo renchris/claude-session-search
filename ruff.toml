@@ -1,0 +1,6 @@
+# The repo's Python predates ruff format. Keep a post-edit `ruff format <file>` from rewriting whole files,
+# so diffs stay reviewable. ruff check is unaffected.
+force-exclude = true
+
+[format]
+exclude = ["bin/session-search.py", "scripts/session-index-tag.py", "scripts/session-index-chunk.py"]

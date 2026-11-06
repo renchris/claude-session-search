@@ -113,6 +113,7 @@ def resolve_mode(
         sys.stdout,
         sys.stderr,
     ),
+    non_interactive: bool = False,
 ) -> Mode:
     stdin_tty, stdout_tty, stderr_tty = (_isatty(stream) for stream in streams)
     picker = environ.get("__SESSION_SEARCH_PICKER") == "1"
@@ -127,7 +128,14 @@ def resolve_mode(
 
     ci = bool(environ.get("CI"))
     agent = bool(environ.get("CLAUDECODE"))
-    interactive = stdin_tty and stderr_tty and not ci and not agent and not json_mode
+    interactive = (
+        stdin_tty
+        and stderr_tty
+        and not ci
+        and not agent
+        and not json_mode
+        and not non_interactive
+    )
     return Mode(
         stdin_tty=stdin_tty,
         stdout_tty=stdout_tty,
@@ -510,6 +518,249 @@ def parse_time(s: str) -> str:
         raise argparse.ArgumentTypeError(
             "Times use ISO 8601 (2026-03-01) or a relative value (7d, 12h)."
         ) from exc
+
+
+class _CliParser(argparse.ArgumentParser):
+    _option_tokens: list[str] = []
+
+    def parse_known_args(
+        self, args: Any = None, namespace: Any = None
+    ) -> tuple[Any, list[str]]:
+        argv = sys.argv[1:] if args is None else list(args)
+        self._option_tokens = argv[: argv.index("--")] if "--" in argv else argv
+        return super().parse_known_args(argv, namespace)
+
+    def _close_match(self, message: str) -> Optional[str]:
+        if not message.startswith("unrecognized arguments:"):
+            return None
+        import difflib  # Only the error path needs it; the SessionStart hook pays for every import.
+
+        declared = [
+            option
+            for action in self._actions
+            if action.help is not argparse.SUPPRESS
+            for option in action.option_strings
+            if option.startswith("--")
+        ]
+        for token in re.findall(r"--[A-Za-z0-9-]+", message):
+            # A prefix is the likeliest intent, and difflib alone ranks --help above --deep-search for --deep.
+            matches = [option for option in declared if option.startswith(token)]
+            matches = matches or difflib.get_close_matches(token, declared, n=1)
+            if matches:
+                return matches[0]
+        return None
+
+    def error(self, message: str) -> NoReturn:
+        match = self._close_match(message)
+        hint = f" Did you mean {match}?" if match else ""
+        if "--json" in self._option_tokens:
+            reason = (
+                "unknown_option"
+                if message.startswith("unrecognized arguments:")
+                else "invalid_arguments"
+            )
+            err = usage_error(f"{message.rstrip('.')}.{hint}")
+            err.reason = reason
+            render_error(err, resolve_mode(json_mode=True))
+            sys.exit(2)
+        print(f"{self.prog}: {message}", file=sys.stderr)
+        if match:
+            print(hint.strip(), file=sys.stderr)
+        print(f"See '{self.prog} --help'.", file=sys.stderr)
+        sys.exit(2)
+
+
+class _NotedStore(argparse.Action):
+    """Store a value and record the spelling used, for options validate_args reacts to."""
+
+    def __call__(
+        self,
+        parser: argparse.ArgumentParser,
+        namespace: argparse.Namespace,
+        values: Any,
+        option_string: Optional[str] = None,
+    ) -> None:
+        setattr(namespace, self.dest, values)
+        namespace.noted = [*namespace.noted, option_string]
+
+
+class _BoolFlag(argparse.Action):
+    """Backs --x, --no-x, --x=true and --x=false.
+
+    Each is a literal option string with nargs=0. A value-taking action (nargs="?") would swallow
+    the query in `--explain "some words"`.
+    """
+
+    def __init__(self, option_strings: list[str], dest: str, **kwargs: Any) -> None:
+        super().__init__(option_strings, dest, nargs=0, **kwargs)
+
+    def __call__(
+        self,
+        parser: argparse.ArgumentParser,
+        namespace: argparse.Namespace,
+        values: Any,
+        option_string: Optional[str] = None,
+    ) -> None:
+        spelling = option_string or ""
+        off = spelling.startswith("--no-") or spelling.endswith("=false")
+        setattr(namespace, self.dest, not off)
+
+
+class _Version(argparse.Action):
+    def __init__(self, option_strings: list[str], dest: str, **kwargs: Any) -> None:
+        super().__init__(
+            option_strings, dest=argparse.SUPPRESS, default=argparse.SUPPRESS, nargs=0, **kwargs
+        )
+
+    def __call__(
+        self,
+        parser: argparse.ArgumentParser,
+        namespace: argparse.Namespace,
+        values: Any,
+        option_string: Optional[str] = None,
+    ) -> None:
+        tokens = getattr(parser, "_option_tokens", [])
+        if "-h" in tokens or "--help" in tokens:
+            parser.print_help()
+        elif "--json" in tokens:
+            emit_json({"version": VERSION})
+        else:
+            print(VERSION)
+        parser.exit(0)
+
+
+def _add_bool(parser: argparse.ArgumentParser, name: str, help_text: str) -> None:
+    dest = name.replace("-", "_")
+    parser.add_argument(
+        f"--{name}", f"--no-{name}", action=_BoolFlag, dest=dest, default=False, help=help_text
+    )
+    parser.add_argument(
+        f"--{name}=true",
+        f"--{name}=false",
+        action=_BoolFlag,
+        dest=dest,
+        default=False,
+        help=argparse.SUPPRESS,
+    )
+
+
+def build_parser() -> argparse.ArgumentParser:
+    hidden = argparse.SUPPRESS
+    parser = _CliParser(
+        prog="claude-search",
+        allow_abbrev=False,
+        description="Search your Claude Code sessions.",
+    )
+    parser.set_defaults(noted=[])
+    add = parser.add_argument
+    add("query", nargs="*", metavar="<QUERY>", help="Words to search for.")
+    add("--json", action="store_true", help="Print one JSON document.")
+    add(
+        "--format",
+        action=_NotedStore,
+        choices=["table", "fzf", "json"],
+        default="table",
+        help=hidden,
+    )
+    add(
+        "-n",
+        "--limit",
+        type=positive_int,
+        default=10,
+        metavar="<NUMBER>",
+        help=f"Results to show (default: 10, max: {LIMIT_CAP}, ordered by relevance).",
+    )
+    add("-p", "--project", metavar="<NAME>", help="Only sessions from this project.")
+    add(
+        "-s",
+        "--since",
+        dest="after",
+        type=parse_time,
+        metavar="<TIME>",
+        help="Only sessions after this time: ISO 8601 or relative (7d, 12h). "
+        "Default: all history. An ISO value with no offset is UTC.",
+    )
+    add(
+        "-u",
+        "--until",
+        dest="before",
+        type=parse_time,
+        metavar="<TIME>",
+        help="Only sessions before this time. Same forms as --since.",
+    )
+    add("--after", action=_NotedStore, type=parse_time, help=hidden)
+    add("--before", action=_NotedStore, type=parse_time, help=hidden)
+    add(
+        "--min-msgs",
+        type=nonneg_int,
+        default=0,
+        metavar="<NUMBER>",
+        help="Only sessions with at least this many messages (default: 0).",
+    )
+    modes = parser.add_mutually_exclusive_group()
+    modes.add_argument("--resume-result", type=positive_int, metavar="<NUMBER>", help=hidden)
+    modes.add_argument("--preview", metavar="<SESSION>", help="Show one session.")
+    modes.add_argument("--context-inject", metavar="<DIR>", help=hidden)
+    modes.add_argument("--stats", action="store_true", help="Show index statistics.")
+    modes.add_argument("--analytics", action="store_true", help="Show search log statistics.")
+    add("--fails", action="store_true", help="With --analytics, show only zero-result queries.")
+    _add_bool(parser, "explain", "Show why each result matched.")
+    _add_bool(parser, "deep-search", "Also search inside session chunks.")
+    add("--no-llm", action="store_true", help="Never send the query to the Anthropic API.")
+    add("--no-log", action="store_true", help=hidden)
+    add("-d", "--debug", action="store_true", help="Print debug details on stderr.")
+    add("--non-interactive", action="store_true", help="Never prompt.")
+    add("--no-color", action="store_true", help="Turn off color.")
+    add("-v", "--version", action=_Version, help="Print the version and exit.")
+    return parser
+
+
+def validate_args(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
+    active_modes = [
+        name
+        for name, active in (
+            ("--stats", args.stats),
+            ("--analytics", args.analytics),
+            ("--preview", args.preview is not None),
+            ("--context-inject", args.context_inject is not None),
+        )
+        if active
+    ]
+    problems = []
+    # any(), not truth of the list: bin/claude-search passes an empty "" query with --analytics.
+    if active_modes and any(args.query):
+        problems.append(f"{active_modes[0]} takes no query.")
+    if args.fails and not args.analytics:
+        problems.append("--fails needs --analytics.")
+    if args.explain and args.json:
+        problems.append("--explain can't be used with --json.")
+    elif args.explain and args.format != "table":
+        problems.append(f"--explain can't be used with --format {args.format}.")
+    if args.json and "--format" in args.noted:
+        problems.append("--json can't be used with --format.")
+    if args.json and args.context_inject is not None:
+        problems.append("--json can't be used with --context-inject.")
+    if problems:
+        parser.error(" ".join(problems))
+
+    clamped = args.limit > LIMIT_CAP
+    if clamped:
+        args.limit = LIMIT_CAP
+    # bin/claude-search captures this path with 2>&1 and treats the result as the session ID,
+    # so a warning line here would break the resume.
+    if args.resume_result is not None:
+        return
+    deprecated = []
+    if args.format == "json":
+        deprecated.append("--format json is deprecated. Use --json.")
+    for alias, replacement in (("--after", "--since"), ("--before", "--until")):
+        if alias in args.noted:
+            deprecated.append(f"{alias} is deprecated. Use {replacement}.")
+    # One line: warn() keeps one entry per reason, so separate calls would lose the later aliases.
+    if deprecated:
+        warn("deprecated", " ".join(deprecated))
+    if clamped:
+        warn("limit_clamped", f"--limit clamped to {LIMIT_CAP}.")
 
 
 # ─── CLI contract layer: end ───
@@ -2272,23 +2523,16 @@ def _load_cached_results():
 # ─── CLI ──────────────────────────────────────────────────
 
 def main():
-    parser = argparse.ArgumentParser(description="Claude Session Search")
-    parser.add_argument("query", nargs="*", help="Search query")
-    parser.add_argument("--format", choices=["table", "fzf", "json"], default="table")
-    parser.add_argument("--limit", type=int, default=10)
-    parser.add_argument("--project", help="Filter by project name")
-    parser.add_argument("--after", help="Filter sessions after date (YYYY-MM-DD)")
-    parser.add_argument("--before", help="Filter sessions before date (YYYY-MM-DD)")
-    parser.add_argument("--min-msgs", type=int, default=0, help="Minimum message count filter")
-    parser.add_argument("--resume-result", type=int, metavar="N", help="Resume result #N (from last search or with query)")
-    parser.add_argument("--preview", metavar="SESSION_ID", help="Preview a session")
-    parser.add_argument("--context-inject", metavar="CWD", help="Generate SessionStart context")
-    parser.add_argument("--stats", action="store_true", help="Show index statistics")
-    parser.add_argument("--explain", action="store_true", help="Show match explanation for each result")
-    parser.add_argument("--analytics", action="store_true", help="Show search log analytics")
-    parser.add_argument("--fails", action="store_true", help="Show only zero-result queries (with --analytics)")
-    parser.add_argument("--deep-search", action="store_true", help="Also search within session chunks for deeper matches")
+    global MODE
+    parser = build_parser()
     args = parser.parse_args()
+    MODE = resolve_mode(
+        no_color=args.no_color,
+        json_mode=args.json,
+        debug=args.debug,
+        non_interactive=args.non_interactive,
+    )
+    validate_args(parser, args)
 
     if not DB_PATH.exists():
         print("No index database found. Run session-index-backfill.sh first.", file=sys.stderr)
@@ -2442,4 +2686,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    run_cli(main)

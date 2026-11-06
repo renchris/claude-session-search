@@ -30,7 +30,7 @@ fails() {
 
 @test "sandbox_setup: the engine in the sandbox answers from the demo DB" {
     [ "$(sqlite3 "$HOME/.claude/session-index.db" "SELECT value != '' FROM meta WHERE key='last_backfill';")" = 1 ]
-    run python3 "$HOME/.claude/bin/session-search.py" --format=json aurora --limit 1
+    run --separate-stderr python3 "$HOME/.claude/bin/session-search.py" --format=json aurora --limit 1
     [ "$status" -eq 0 ]
     printf '%s' "$output" | jq -e '.[0].session_id == "7f3a9c21e4d50a18"'
 }

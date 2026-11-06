@@ -13,6 +13,7 @@ Usage:
     session-index-tag.py --regex-only                 # Skip API
     session-index-tag.py --quiet                      # No banner, progress or summary
     session-index-tag.py --retag-summaries            # Fill empty summaries via Haiku
+    session-index-tag.py --json                       # One JSON document on stdout
 """
 
 import argparse
@@ -30,6 +31,7 @@ import sqlite3
 import sys
 import threading
 import time
+import traceback
 import unicodedata
 from collections.abc import Callable, Iterator
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -100,6 +102,13 @@ def stdout_palette(no_color: bool = False) -> Palette:
 
 def stderr_palette(no_color: bool = False) -> Palette:
     return Palette(cli_common.resolve_style(sys.stderr, no_color))
+
+
+def _blank_terminal_codes() -> None:
+    """--json: stdout is a document on a terminal too, so no path may add a code to it."""
+    global BOLD, DIM, RESET, GREEN, RED, CYAN, YELLOW, HIDE_CURSOR, SHOW_CURSOR
+    BOLD = DIM = RESET = GREEN = RED = CYAN = YELLOW = HIDE_CURSOR = SHOW_CURSOR = ""
+
 
 # ─── Regex Patterns ──────────────────────────────────────────────
 
@@ -849,6 +858,143 @@ def print_next_step(
     _err_line(f"    {cli_common.sanitize_display(_rerun_command(args, remaining))}")
 
 
+# ─── Machine Output ──────────────────────────────────────────────
+
+
+class _ReasonedError(cli_common.CliError):
+    """A pre-work failure. run_cli prints it as any CliError; --json also needs the reason."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        reason: str,
+        status: str = "error",
+        recovery: tuple[tuple[str, str], ...] = (),
+    ) -> None:
+        super().__init__(message, recovery=recovery)
+        self.reason = reason
+        self.status = status
+
+
+def _emit_document(doc: dict[str, Any]) -> None:
+    # run_cli reads a BrokenPipeError as exit 0, which would hide a failed batch.
+    try:
+        cli_common.emit_json(doc)
+        sys.stdout.flush()
+    except (OSError, ValueError, AttributeError):
+        cli_common.detach_stdout()
+
+
+def _emit_error_document(
+    message: str,
+    reason: str,
+    status: str = "error",
+    recovery: tuple[tuple[str, str], ...] = (),
+    data: dict[str, str] | None = None,
+) -> None:
+    """The one stderr line --json allows a failure. Same shape as the engine's."""
+    doc: dict[str, Any] = {
+        "status": status,
+        "reason": reason,
+        "message": message,
+        "next": [
+            {
+                "command": command,
+                "argv": [os.path.expanduser(word) for word in shlex.split(command)],
+            }
+            for _, command in recovery
+        ],
+    }
+    if data is not None:
+        doc["data"] = data
+    _err_line(json.dumps(doc, separators=(",", ":"), default=str))
+
+
+def _bug_data(exc: Exception) -> dict[str, str]:
+    frames = traceback.extract_tb(exc.__traceback__)
+    # Type and basename only: the exception's message can hold argv or path text.
+    location = (
+        f"{os.path.basename(frames[-1].filename)}:{frames[-1].lineno}"
+        if frames
+        else "unknown"
+    )
+    return {
+        "error": type(exc).__name__,
+        "location": location,
+        "version": cli_common.VERSION,
+        "python": ".".join(str(part) for part in sys.version_info[:3]),
+        "platform": sys.platform,
+        "report": cli_common.ISSUES_URL,
+    }
+
+
+def _json_row(
+    result: "TagResult", args: argparse.Namespace, write_failed: bool
+) -> tuple[dict[str, str], str]:
+    """One session's row and the summary counter it lands in.
+
+    The row vocabulary has no "failed": a session that failed is skipped and names why.
+    A dry run fails nothing, and a session the deadline cut was not attempted. no_match and
+    empty_text are skips: those rows stay selectable, so as failures they would make every
+    --json run on that database exit 1.
+    """
+    sid = result.session_id
+
+    def skipped(error: str, counter: str) -> tuple[dict[str, str], str]:
+        return {"id": sid, "outcome": "skipped", "error": error}, counter
+
+    if args.dry_run:
+        planned = (
+            result.error_category != "empty_text"
+            if args.retag_summaries
+            else result.success
+        )
+        if planned:
+            return {"id": sid, "outcome": "planned"}, "succeeded"
+        return skipped(result.error_category, "skipped")
+    if result.error_category == "deadline":
+        return skipped("deadline", "unknown")
+    if result.error_category in ("no_match", "empty_text"):
+        return skipped(result.error_category, "skipped")
+    if not result.success:
+        return skipped(result.error_category, "failed")
+    if args.retag_summaries and not result.summary:
+        # The batch write skips a retag with no summary, so it stays selectable.
+        return skipped(result.fallback_reason or "no_summary", "failed")
+    if write_failed:
+        return skipped("write_failed", "failed")
+    return {"id": sid, "outcome": "tagged"}, "succeeded"
+
+
+def _bulk_document(
+    results: list["TagResult"],
+    sessions: list[dict[str, str]],
+    args: argparse.Namespace,
+    write_error: str = "",
+) -> dict[str, Any]:
+    # Threads finish in any order; the document follows the selection.
+    position = {session["session_id"]: i for i, session in enumerate(sessions)}
+    summary = {"succeeded": 0, "failed": 0, "skipped": 0, "unknown": 0}
+    rows = []
+    for result in sorted(results, key=lambda r: position[r.session_id]):
+        row, counter = _json_row(result, args, bool(write_error))
+        rows.append(row)
+        summary[counter] += 1
+    doc: dict[str, Any] = {"results": rows, "summary": summary}
+    if write_error:
+        doc["warnings"] = [
+            {
+                "reason": "not_persisted",
+                "message": (
+                    f"Database write failed: {write_error}. The write is one transaction, "
+                    "so nothing was persisted and every session is safe to retry."
+                ),
+            }
+        ]
+    return doc
+
+
 # ─── Error Categories ────────────────────────────────────────────
 
 
@@ -976,6 +1122,7 @@ _EPILOG = """\
 Examples:
   session-index-tag.py --project acme --dry-run
   session-index-tag.py --regex-only --limit 50
+  session-index-tag.py --regex-only --json
 
 Notes:
   ANTHROPIC_API_KEY enables Haiku tagging. If it is unset or empty, the tagger
@@ -983,10 +1130,17 @@ Notes:
   it. It is read from the environment only and never stored.
   --dry-run prints one regex-preview row per session on stdout. It makes no API
   calls, takes no lock and writes nothing.
+  --json prints one document on stdout and implies --quiet. Each row in "results"
+  has an id, an outcome (tagged, skipped or planned) and, if skipped, an error.
+  In "summary", "skipped" counts sessions with no text or no matching tag,
+  "failed" counts API and write failures, and "unknown" counts sessions the API
+  time budget left unattempted. A failure before any work prints nothing on
+  stdout and one JSON line on stderr.
 
 Exit codes:
   0    success
   1    failure, including a held lock or a missing key under --retag-summaries
+       --json only: also when any session failed or was not attempted
   2    usage error
   130  interrupted after the work window
 """
@@ -1037,6 +1191,29 @@ def build_parser() -> argparse.ArgumentParser:
             "with no tags also gets tags and tagged_at (requires ANTHROPIC_API_KEY)"
         ),
     )
+    parser.add_argument(
+        "--json",
+        action="store_true",
+        help="print one JSON document on stdout; implies --quiet",
+    )
+    parser.add_argument(
+        "-v",
+        "--version",
+        action="store_true",
+        help="print the version and exit",
+    )
+    parser.add_argument("--no-color", action="store_true", help="turn off color")
+    parser.add_argument(
+        "-d",
+        "--debug",
+        action="store_true",
+        help="show tracebacks for internal errors",
+    )
+    parser.add_argument(
+        "--non-interactive",
+        action="store_true",
+        help="accepted for scripts; the tagger never prompts",
+    )
     return parser
 
 
@@ -1054,17 +1231,76 @@ def _selection(args: argparse.Namespace) -> tuple[str, tuple[str, ...]]:
 
 def main() -> None:
     args = build_parser().parse_args()
+    args.quiet = args.quiet or args.json
 
-    # The one place --no-color would feed style resolution.
-    no_color = False
+    # The environment, because run_cli's error path never sees the parsed flags.
+    if args.no_color:
+        os.environ["__SESSION_SEARCH_NO_COLOR"] = "1"
+    if args.debug:
+        os.environ["SESSION_SEARCH_DEBUG"] = "1"
+
+    # After parsing, so --help wins, and before anything that needs a database.
+    if args.version:
+        if args.json:
+            _emit_document({"version": cli_common.VERSION})
+        else:
+            print(cli_common.VERSION)
+        return
+
+    if not args.json:
+        _run(args)
+        return
+
+    _blank_terminal_codes()
+    try:
+        _run(args)
+    except _ReasonedError as err:
+        _emit_error_document(err.message, err.reason, err.status, err.recovery)
+        sys.exit(err.code)
+    except cli_common.CliError as err:
+        _emit_error_document(err.message, "internal_error", recovery=err.recovery)
+        sys.exit(err.code)
+    except KeyboardInterrupt:
+        _emit_error_document("Canceled.", "canceled")
+        sys.exit(130)
+    except sqlite3.Error as exc:
+        _emit_error_document(
+            f"Could not read session index {DB_PATH}: {exc}",
+            "internal_error",
+            recovery=(("Rebuild it:", "~/.claude/bin/session-index-backfill.sh"),),
+        )
+        sys.exit(1)
+    except Exception as exc:
+        if os.environ.get("SESSION_SEARCH_DEBUG"):
+            _err_line("".join(traceback.format_exception(exc)).rstrip("\n"))
+        _emit_error_document(
+            "Unexpected error in session-index-tag.py. "
+            "This is a bug in claude-session-search.",
+            "internal_error",
+            data=_bug_data(exc),
+        )
+        sys.exit(1)
+
+
+def _run(args: argparse.Namespace) -> None:
+    no_color = args.no_color
     palette = stdout_palette(no_color)
     # A dry run keeps stdout for rows, so everything else it says goes to stderr.
     report_palette = stderr_palette(no_color) if args.dry_run else palette
+    if args.json:
+        palette = report_palette = Palette(cli_common.Style(colour=False, rich=False))
     emit: Callable[[str], None] = _err_line if args.dry_run else print
 
     # ─── Validate database exists ─────────────────────────────────
 
     if not DB_PATH.exists():
+        if args.json:
+            raise _ReasonedError(
+                "No index database. Run session-index-backfill.sh first.",
+                reason="not_found",
+                status="action_required",
+                recovery=(("Build it:", "~/.claude/bin/session-index-backfill.sh"),),
+            )
         print(
             "No index database. Run session-index-backfill.sh first.",
             file=sys.stderr,
@@ -1078,6 +1314,8 @@ def main() -> None:
 
     def cleanup_handler(signum: int, frame: object) -> None:
         _restore_cursor()
+        if args.json:
+            _emit_error_document("Canceled.", "canceled")
         sys.exit(1)
 
     signal.signal(signal.SIGINT, cleanup_handler)
@@ -1098,15 +1336,18 @@ def main() -> None:
             if lock_file:
                 lock_file.close()
             # Hooks take this lock too, so naming the holder would be a guess.
-            raise cli_common.CliError(
+            raise _ReasonedError(
                 f"Can't tag sessions. Another session-index process holds {lock_path}.",
+                reason="lock_held",
                 recovery=(("When it finishes, rerun:", shlex.join(["python3", *sys.argv])),),
             ) from exc
         except OSError as exc:
             if lock_file:
                 lock_file.close()
-            raise cli_common.CliError(
+            raise _ReasonedError(
                 f"Failed to lock {lock_path}. {exc.strerror}.",
+                reason="lock_failed",
+                status="action_required",
                 recovery=(
                     ("Fix access to that path, then rerun:", shlex.join(["python3", *sys.argv])),
                 ),
@@ -1122,6 +1363,12 @@ def main() -> None:
     # ─── Validate --retag-summaries constraints ────────────────────
 
     if args.retag_summaries and effective_regex_only:
+        if args.json:
+            raise _ReasonedError(
+                "--retag-summaries requires Haiku API. Set ANTHROPIC_API_KEY.",
+                reason="invalid_config",
+                status="action_required",
+            )
         print(
             "--retag-summaries requires Haiku API. Set ANTHROPIC_API_KEY.",
             file=sys.stderr,
@@ -1150,6 +1397,8 @@ def main() -> None:
     ).fetchone()[0]
 
     if not rows:
+        if args.json:
+            _emit_document(_bulk_document([], [], args))
         if not args.quiet:
             if report_palette.rich:
                 p = report_palette
@@ -1323,6 +1572,10 @@ def main() -> None:
                 with contextlib.suppress(sqlite3.Error):
                     conn.execute("ROLLBACK")
             log(f"Database write failed: {e}")
+            if args.json:
+                conn.close()
+                _emit_document(_bulk_document(results, sessions, args, write_error=str(e)))
+                sys.exit(1)
             with contextlib.suppress(OSError):
                 print(f"Database write failed: {e}", file=sys.stderr)
             _restore_cursor()
@@ -1439,6 +1692,12 @@ def main() -> None:
             f"[regex={regex_count} haiku={haiku_count}] "
             f"{' '.join(log_details)}"
         )
+
+    if args.json:
+        doc = _bulk_document(results, sessions, args)
+        _emit_document(doc)
+        if doc["summary"]["failed"] or doc["summary"]["unknown"]:
+            sys.exit(1)
 
     # sys.stdout is None when fd 1 was closed before the interpreter started.
     if sys.stdout is not None:

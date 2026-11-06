@@ -21,23 +21,498 @@ Usage:
 """
 
 import argparse
+import itertools
 import json
 import math
 import os
 import re
+import shlex
 import shutil
 import signal
 import sqlite3
 import sys
+import tempfile
+import threading
 import time
+import traceback
+import unicodedata
+from collections.abc import Callable, Iterator, Mapping
+from contextlib import contextmanager
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Optional
+from typing import Any, NoReturn, Optional, TextIO
 
 signal.signal(signal.SIGPIPE, signal.SIG_DFL)
 
 DB_PATH = Path.home() / ".claude" / "session-index.db"
 CACHE_PATH = Path.home() / ".claude" / ".last-search-results.json"
+
+# ─── CLI contract layer: begin ───
+
+VERSION = "0.1.0"
+ENV = "SESSION_SEARCH_"
+LIMIT_CAP = 200
+REASONS = frozenset(
+    {
+        "invalid_arguments",
+        "unknown_option",
+        "missing_query",
+        "not_found",
+        "api_error",
+        "spawn_failed",
+        "invalid_config",
+        "partial_failure",
+        "internal_error",
+        "canceled",
+        "deprecated",
+        "limit_clamped",
+    }
+)
+ISSUES_URL = "https://github.com/renchris/claude-session-search/issues"
+
+# One entry per reason warned about this run. warn() dedupes on it; JSON documents carry it.
+WARNINGS: list[dict[str, str]] = []
+
+_CLEAR_LINE = "\r\033[K"
+_SPINNER_FRAMES = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+
+
+@dataclass(frozen=True)
+class Mode:
+    stdin_tty: bool
+    stdout_tty: bool
+    stderr_tty: bool
+    color_out: bool
+    color_err: bool
+    ci: bool
+    agent: bool
+    interactive: bool
+    json: bool
+    tips: bool
+    debug: bool
+    accessible: bool
+    picker: bool
+
+
+def _isatty(stream: Optional[TextIO]) -> bool:
+    # A closed or missing std stream (hooks may run with fds closed) is simply not a terminal.
+    try:
+        return stream is not None and stream.isatty()
+    except (ValueError, OSError):
+        return False
+
+
+def resolve_mode(
+    no_color: bool = False,
+    json_mode: bool = False,
+    debug: bool = False,
+    environ: Mapping[str, str] = os.environ,
+    streams: tuple[Optional[TextIO], Optional[TextIO], Optional[TextIO]] = (
+        sys.stdin,
+        sys.stdout,
+        sys.stderr,
+    ),
+) -> Mode:
+    stdin_tty, stdout_tty, stderr_tty = (_isatty(stream) for stream in streams)
+    picker = environ.get("__SESSION_SEARCH_PICKER") == "1"
+
+    def color(tty: bool) -> bool:
+        if no_color or environ.get("NO_COLOR"):
+            return False
+        force = environ.get("FORCE_COLOR")
+        if force:
+            return force != "0"
+        return picker or (tty and environ.get("TERM") != "dumb")
+
+    ci = bool(environ.get("CI"))
+    agent = bool(environ.get("CLAUDECODE"))
+    interactive = stdin_tty and stderr_tty and not ci and not agent and not json_mode
+    return Mode(
+        stdin_tty=stdin_tty,
+        stdout_tty=stdout_tty,
+        stderr_tty=stderr_tty,
+        color_out=color(stdout_tty),
+        color_err=color(stderr_tty),
+        ci=ci,
+        agent=agent,
+        interactive=interactive,
+        json=json_mode,
+        tips=interactive
+        and stdout_tty
+        and not json_mode
+        and not environ.get(f"{ENV}GUIDANCE_DISABLED"),
+        debug=debug or bool(environ.get(f"{ENV}DEBUG")),
+        accessible=environ.get(f"{ENV}ACCESSIBLE") == "1",
+        picker=picker,
+    )
+
+
+MODE: Mode = resolve_mode()
+
+
+@dataclass(frozen=True)
+class Theme:
+    heading: str = ""
+    accent: str = ""
+    success: str = ""
+    warn: str = ""
+    muted: str = ""
+    ident: str = ""
+    match_on: str = ""
+    match_off: str = ""
+    reset: str = ""
+    H: str = "─"
+    V: str = "│"
+    TL: str = "╭"
+    TR: str = "╮"
+    BL: str = "╰"
+    BR: str = "╯"
+    ML: str = "├"
+    MR: str = "┤"
+    THIN_V: str = "│"
+    BULLET: str = "•"
+    ARROW: str = "→"
+
+
+_ROLES = {
+    "heading": "\033[1m",
+    "accent": "\033[36m",
+    "success": "\033[32m",
+    "warn": "\033[33m",
+    "muted": "\033[2m",
+    "ident": "\033[35m",
+    "match_on": "\033[1;33m",
+    "match_off": "\033[0m",
+    "reset": "\033[0m",
+}
+_ACCESSIBLE_GLYPHS = {
+    "H": "-",
+    "V": "|",
+    "TL": "+",
+    "TR": "+",
+    "BL": "+",
+    "BR": "+",
+    "ML": "+",
+    "MR": "+",
+    "THIN_V": "|",
+    "BULLET": "-",
+    "ARROW": "to",
+}
+
+
+def _theme_for(mode: Mode, stream: str) -> Theme:
+    color, tty = (
+        (mode.color_out, mode.stdout_tty)
+        if stream == "out"
+        else (mode.color_err, mode.stderr_tty)
+    )
+    if not color:
+        roles: dict[str, str] = {}
+    elif tty or mode.picker:
+        roles = _ROLES
+    else:
+        # Forced colour on plain output tints only the Warning:/Error: prefixes.
+        roles = {"warn": _ROLES["warn"], "reset": _ROLES["reset"]}
+    return Theme(**roles, **(_ACCESSIBLE_GLYPHS if mode.accessible else {}))
+
+
+def theme(stream: str = "out") -> Theme:
+    return _theme_for(MODE, stream)
+
+
+_ESCAPE_SEQUENCE = re.compile(
+    r"\x1b\[[0-?]*[ -/]*[@-~]"  # CSI
+    r"|\x1b[\]PX^_].*?(?:\x07|\x1b\\|\Z)"  # OSC, DCS, SOS, PM, APC
+    r"|\x1b[ -/]*[0-~]",  # any other escape sequence
+    re.DOTALL,
+)
+_WHITESPACE_TO_SPACE = str.maketrans("\t\n\r", "   ")
+
+
+def sanitize_display(s: str, keep_hl: bool = False) -> str:
+    if s.isprintable():
+        return s
+    kept = []
+    for ch in _ESCAPE_SEQUENCE.sub("", s).translate(_WHITESPACE_TO_SPACE):
+        code = ord(ch)
+        if code < 0x20 or 0x7F <= code <= 0x9F:
+            if keep_hl and ch in "\x02\x03":
+                kept.append(ch)
+        elif unicodedata.category(ch) != "Cf":
+            kept.append(ch)
+    return "".join(kept)
+
+
+def plural(n: int, one: str, many: Optional[str] = None) -> str:
+    return f"{n} {one if n == 1 else (many or one + 's')}"
+
+
+def _rich_err(mode: Mode) -> bool:
+    return mode.stderr_tty and mode.color_err and not mode.accessible
+
+
+def _check_reason(reason: str) -> None:
+    if reason not in REASONS:
+        raise ValueError(f"reason {reason!r} is not in REASONS")
+
+
+def warn(reason: str, message: str) -> None:
+    _check_reason(reason)
+    if any(entry["reason"] == reason for entry in WARNINGS):
+        return
+    WARNINGS.append({"reason": reason, "message": message})
+    if MODE.json:
+        return
+    t = theme("err")
+    prefix = "!" if _rich_err(MODE) else "Warning:"
+    print(f"{t.warn}{prefix}{t.reset} {sanitize_display(message)}", file=sys.stderr)
+
+
+class CliError(Exception):
+    def __init__(
+        self,
+        message: str,
+        *,
+        code: int = 1,
+        reason: str = "internal_error",
+        recovery: tuple[tuple[str, str], ...] = (),
+        status: str = "error",
+        data: Any = None,
+        retryable: Optional[bool] = None,
+    ) -> None:
+        super().__init__(message)
+        _check_reason(reason)
+        self.message = message
+        self.code = code
+        self.reason = reason
+        self.recovery = tuple(recovery)[:2]
+        self.status = status
+        self.data = data
+        self.retryable = retryable
+
+
+def usage_error(message: str) -> CliError:
+    return CliError(
+        message,
+        code=2,
+        reason="invalid_arguments",
+        status="action_required",
+        recovery=(("See help:", "claude-search --help"),),
+    )
+
+
+def _next_entry(command: str) -> dict[str, Any]:
+    try:
+        words = shlex.split(command)
+    except ValueError:
+        words = command.split()
+    # argv runs without a shell, so nothing else would expand a leading ~.
+    return {"command": command, "argv": [os.path.expanduser(word) for word in words]}
+
+
+def _print_human_error(
+    headline: str,
+    recovery: tuple[tuple[str, str], ...],
+    mode: Mode,
+    rows: tuple[str, ...] = (),
+) -> None:
+    t = _theme_for(mode, "err")
+    prefix = "✗" if _rich_err(mode) else "Error:"
+    print(f"{t.warn}{prefix}{t.reset} {sanitize_display(headline)}", file=sys.stderr)
+    for row in rows:
+        print(row, file=sys.stderr)
+    for instruction, command in recovery:
+        print(file=sys.stderr)
+        print(sanitize_display(instruction.rstrip(":")) + ":", file=sys.stderr)
+        print(f"    {sanitize_display(command)}", file=sys.stderr)
+
+
+def render_error(err: CliError, mode: Mode) -> None:
+    if not mode.json:
+        _print_human_error(err.message, err.recovery, mode)
+        return
+    doc: dict[str, Any] = {
+        "status": err.status,
+        "reason": err.reason,
+        "message": err.message,
+        "next": [_next_entry(command) for _, command in err.recovery],
+    }
+    if err.data is not None:
+        doc["data"] = err.data
+    if err.retryable is not None:
+        doc["retryable"] = err.retryable
+    if WARNINGS:
+        doc["warnings"] = WARNINGS
+    print(json.dumps(doc, separators=(",", ":"), default=str), file=sys.stderr)
+
+
+def _report_bug(exc: Exception) -> None:
+    if MODE.debug:
+        traceback.print_exception(type(exc), exc, exc.__traceback__, file=sys.stderr)
+    frames = traceback.extract_tb(exc.__traceback__)
+    # Type and basename only: the exception's message can hold argv or path text.
+    location = (
+        f"{os.path.basename(frames[-1].filename)}:{frames[-1].lineno}"
+        if frames
+        else "unknown"
+    )
+    error_type = type(exc).__name__
+    python = ".".join(str(part) for part in sys.version_info[:3])
+    headline = (
+        "Unexpected error in claude-search. This is a bug in claude-session-search."
+    )
+    if MODE.json:
+        data = {
+            "error": error_type,
+            "location": location,
+            "version": VERSION,
+            "python": python,
+            "platform": sys.platform,
+            "report": ISSUES_URL,
+        }
+        render_error(CliError(headline, data=data), MODE)
+        return
+    rows = (
+        f"Error:   {error_type} at {location}",
+        f"Version: claude-search {VERSION}, Python {python}, {sys.platform}",
+    )
+    _print_human_error(headline, (("Report it:", ISSUES_URL),), MODE, rows)
+
+
+def run_cli(main_fn: Callable[[], Optional[int]]) -> NoReturn:
+    try:
+        sys.exit(main_fn() or 0)
+    except CliError as err:
+        render_error(err, MODE)
+        sys.exit(err.code)
+    except KeyboardInterrupt:
+        if MODE.json:
+            render_error(
+                CliError(
+                    "Canceled.", code=130, reason="canceled", data={"remote": "none"}
+                ),
+                MODE,
+            )
+        else:
+            if _spinner_allowed(MODE):
+                sys.stderr.write(_CLEAR_LINE)
+            print("Canceled.", file=sys.stderr)
+        sys.exit(130)
+    except sqlite3.Error as exc:
+        render_error(
+            CliError(
+                f"Search index error: {type(exc).__name__} in ~/.claude/session-index.db.",
+                recovery=(("Rebuild it:", "~/.claude/bin/session-index-backfill.sh"),),
+            ),
+            MODE,
+        )
+        sys.exit(1)
+    except Exception as exc:
+        _report_bug(exc)
+        sys.exit(1)
+
+
+def emit_json(doc: Any, stream: Optional[TextIO] = None) -> None:
+    target = sys.stdout if stream is None else stream
+    if MODE.json and WARNINGS and isinstance(doc, dict) and "warnings" not in doc:
+        doc = {**doc, "warnings": WARNINGS}
+    if _isatty(target):
+        text = json.dumps(doc, indent=2, default=str)
+    else:
+        text = json.dumps(doc, separators=(",", ":"), default=str)
+    target.write(text + "\n")
+
+
+def atomic_write_text(path: Path, text: str) -> None:
+    path = Path(path)
+    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def _spinner_allowed(mode: Mode) -> bool:
+    return mode.interactive and mode.color_err and not mode.json
+
+
+@contextmanager
+def spinner(label: str, mode: Mode) -> Iterator[None]:
+    if not _spinner_allowed(mode):
+        yield
+        return
+    stream = sys.stderr
+    if mode.accessible:
+        print(label, file=stream, flush=True)
+        yield
+        return
+
+    stop = threading.Event()
+
+    def animate() -> None:
+        for frame in itertools.cycle(_SPINNER_FRAMES):
+            stream.write(f"\r{frame} {label}")
+            stream.flush()
+            if stop.wait(0.1):
+                return
+
+    thread = threading.Thread(target=animate, daemon=True)
+    thread.start()
+    try:
+        yield
+    finally:
+        stop.set()
+        try:
+            thread.join(1.0)
+        finally:
+            stream.write(_CLEAR_LINE)
+            stream.flush()
+
+
+def _whole_number(s: str, minimum: int) -> int:
+    if not re.fullmatch(r"[0-9]+", s) or int(s) < minimum:
+        raise argparse.ArgumentTypeError(f"must be a whole number of {minimum} or more")
+    return int(s)
+
+
+def positive_int(s: str) -> int:
+    return _whole_number(s, 1)
+
+
+def nonneg_int(s: str) -> int:
+    return _whole_number(s, 0)
+
+
+def parse_time(s: str) -> str:
+    try:
+        relative = re.fullmatch(r"([0-9]+)([dhm]?)", s)
+        if relative:
+            unit = {"": "days", "d": "days", "h": "hours", "m": "minutes"}[relative[2]]
+            moment = datetime.now(timezone.utc) - timedelta(**{unit: int(relative[1])})
+        else:
+            # Python 3.10's fromisoformat does not accept a trailing Z.
+            parsed = datetime.fromisoformat(s[:-1] + "+00:00" if s.endswith("Z") else s)
+            if parsed.tzinfo is None:
+                moment = parsed.replace(tzinfo=timezone.utc)
+            else:
+                moment = parsed.astimezone(timezone.utc)
+        return moment.isoformat()
+    except (ValueError, OverflowError) as exc:
+        raise argparse.ArgumentTypeError(
+            "Times use ISO 8601 (2026-03-01) or a relative value (7d, 12h)."
+        ) from exc
+
+
+# ─── CLI contract layer: end ───
 
 # ─── Stopwords ───────────────────────────────────────────
 

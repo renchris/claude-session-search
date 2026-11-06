@@ -1,51 +1,240 @@
 #!/bin/bash
-# Claude Session Search — Interactive CLI with fzf support.
+# Claude Session Search: resumes sessions and opens the fzf picker; bin/session-search.py does the rest.
 #
 # Usage:
 #   claude-search "bottle menu"                # Search, show ranked results
 #   claude-search --fzf "bottle"               # Interactive fzf mode
 #   claude-search --resume 1 "bottle"          # Resume result #1 from search
 #   claude-search --resume 3                   # Resume result #3 from last search
-#   claude-search --after 2026-03-01 "rum"     # Date filter
-#   claude-search --json "floor plan"          # JSON output
+#   claude-search --since 7d "rum"             # Date filter
+#   claude-search --json "floor plan"          # One JSON document
 #   claude-search --stats                      # Index statistics
+#   claude-search --analytics                  # Search log statistics
 #   claude-search --preview <session_id>       # Preview session details
+#
+# Deploys as one copied file on bash 3.2, so it sources nothing: no mapfile, associative arrays or
+# ${v,,}, and ${ARR[@]+"${ARR[@]}"} for an array that may be empty under set -u.
 set -euo pipefail
 
 SEARCH_PY="$HOME/.claude/bin/session-search.py"
+UUID_RE='^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'
+RESULT_NUMBER_RE='^0*[1-9][0-9]*$'
 
-if [ ! -f "$SEARCH_PY" ]; then
-    echo "Error: session-search.py not found at $SEARCH_PY" >&2
-    echo "Run install.sh from the claude-session-search repo." >&2
+# Hand-written, because it must work with no engine installed. tests/wrapper.bats checks it against
+# the engine's own --help, runs every example, and keeps it within 80 columns.
+usage() {
+    cat <<'USAGE'
+Usage: claude-search [options] <QUERY>...
+Search your Claude Code sessions and resume one.
+
+Arguments:
+  <QUERY>...                Words to search for.
+
+Options:
+  --analytics               Show search log statistics.
+  -d, --debug               Print debug details on stderr.
+  --deep-search, --no-deep-search
+                            Also search inside session chunks.
+  --explain, --no-explain   Show why each result matched.
+  --fails                   With --analytics, show only zero-result queries.
+  --fzf                     Pick a result in an interactive fzf list.
+  -h, --help                Show this help.
+  --json                    Print one JSON document.
+  -n, --limit <NUMBER>      Results to show (default: 10, max: 200).
+  --min-msgs <NUMBER>       Only sessions with at least this many messages
+                            (default: 0).
+  --no-color                Turn off color.
+  --no-llm                  Never send the query to the Anthropic API.
+  --non-interactive         Never prompt.
+  --preview <SESSION>       Show one session.
+  -p, --project <NAME>      Only sessions from this project.
+  --resume <SESSION>        Resume a session in Claude Code.
+  -s, --since <TIME>        Only sessions after this time: ISO 8601 or relative
+                            (7d, 12h). Default: all history.
+  --stats                   Show index statistics.
+  -u, --until <TIME>        Only sessions before this time. Same forms as
+                            --since.
+  -v, --version             Print the version and exit.
+
+Examples:
+  Search your sessions:
+    claude-search "<QUERY>"
+
+  Pick a result in a list and resume it:
+    claude-search --fzf "<QUERY>"
+
+  Resume one session:
+    claude-search --resume <SESSION>
+
+Notes:
+  <SESSION> is a full session ID. --resume also takes a result number from
+  the last search.
+  claude-search -- help searches for the word help.
+  Results go to stdout; everything else goes to stderr.
+  A search writes search_log and ~/.claude/.last-search-results.json, and may
+  start a background refresh of a stale index.
+  Few local matches can send the query to api.anthropic.com when
+  ANTHROPIC_API_KEY is set; --no-llm or SESSION_SEARCH_NO_LLM=1 stops that.
+  SESSION_SEARCH_GUIDANCE_DISABLED: any non-empty value hides next-step tips.
+  SESSION_SEARCH_DEBUG: any non-empty value does what --debug does.
+  SESSION_SEARCH_ACCESSIBLE: 1 prints plain glyphs and refuses --fzf; any
+  other value is off.
+  An empty value is the same as unset. These are read on every run.
+  Exit codes: 0 success or empty result; 1 failure, including a missing
+  engine, fzf or claude; 2 usage error; 130 canceled.
+
+Learn more:
+  https://github.com/renchris/claude-session-search
+USAGE
+}
+
+usage_fail() {
+    printf 'claude-search: %s\n' "$1" >&2
+    printf "See 'claude-search --help'.\n" >&2
+    exit 2
+}
+
+# need_value "$@" from a parse arm. A help flag in the value's place still wins (-h anywhere).
+need_value() {
+    [ $# -ge 2 ] || usage_fail "Missing value for $1."
+    case "$2" in
+        -h|--help)
+            usage
+            exit 0
+            ;;
+    esac
+}
+
+# The repo install.sh lives in, when this script is the symlink install.sh made.
+repo_hint() {
+    local link
+    if [ -L "$0" ]; then
+        link="$(readlink "$0")"
+        case "$link" in
+            /*/bin/claude-search)
+                printf '%s\n' "${link%/bin/claude-search}"
+                return 0
+                ;;
+        esac
+    fi
+    printf '%s\n' /path/to/claude-session-search
+}
+
+require_engine() {
+    [ ! -f "$SEARCH_PY" ] || return 0
+    {
+        echo "Can't run claude-search: engine not found at ~/.claude/bin/session-search.py."
+        echo
+        echo "Install it:"
+        echo "    bash $(repo_hint)/install.sh"
+    } >&2
     exit 1
-fi
+}
 
-# Parse arguments
+# Replaces this process with `claude --resume`, so it must not hold anything an EXIT trap would
+# clean up. A workflow result (wf_...) is a file, not a session, so it never gets that far.
+resume_session() {
+    local id="$1"
+    case "$id" in
+        wf_*)
+            printf 'claude-search: %s is a workflow result, not a session.\n' "$id" >&2
+            exit 1
+            ;;
+        ''|-*|*[!A-Za-z0-9_-]*)
+            printf 'claude-search: Not a session ID: %q\n' "$id" >&2
+            exit 1
+            ;;
+    esac
+    if ! command -v claude >/dev/null 2>&1; then
+        {
+            echo "Can't resume session $id: claude not found."
+            echo
+            echo "Install it:"
+            echo "    npm install -g @anthropic-ai/claude-code"
+        } >&2
+        exit 1
+    fi
+    echo "Resuming session $id" >&2
+    exec claude --resume "$id"
+}
+
+# ─── Parse ───────────────────────────────────────────────
+
 FZF_MODE=false
-RESUME_N=""
-ARGS=()
+RESUME_SET=false
+RESUME_VALUE=""
+MODE_TOKEN=""
+WANT_VERSION=false
+NON_INTERACTIVE=false
+FWD=()
 QUERY_PARTS=()
+
+if [ $# -eq 0 ] || { [ $# -eq 1 ] && [ "$1" = help ]; }; then
+    usage
+    exit 0
+fi
 
 while [ $# -gt 0 ]; do
     case "$1" in
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        -v|--version)
+            WANT_VERSION=true
+            shift
+            ;;
         --fzf)
             FZF_MODE=true
             shift
             ;;
         --resume)
-            RESUME_N="$2"
+            need_value "$@"
+            RESUME_SET=true
+            RESUME_VALUE="$2"
             shift 2
             ;;
-        --stats|--json)
-            ARGS+=("$1")
+        --resume=*)
+            RESUME_VALUE="${1#--resume=}"
+            [ -n "$RESUME_VALUE" ] || usage_fail "Missing value for --resume."
+            RESUME_SET=true
             shift
             ;;
-        --preview|--after|--before|--project|--limit|--format|--min-msgs)
-            ARGS+=("$1" "$2")
+        --json|--stats|--analytics)
+            MODE_TOKEN="${MODE_TOKEN:-$1}"
+            FWD+=("$1")
+            shift
+            ;;
+        --preview|--context-inject)
+            need_value "$@"
+            MODE_TOKEN="${MODE_TOKEN:-$1}"
+            FWD+=("$1" "$2")
             shift 2
             ;;
+        --preview=*|--context-inject=*)
+            MODE_TOKEN="${MODE_TOKEN:-${1%%=*}}"
+            FWD+=("$1")
+            shift
+            ;;
+        --after|--before|--since|--until|--project|--limit|--min-msgs|--format|-s|-u|-p|-n)
+            need_value "$@"
+            FWD+=("$1" "$2")
+            shift 2
+            ;;
+        --non-interactive)
+            NON_INTERACTIVE=true
+            FWD+=("$1")
+            shift
+            ;;
+        --)
+            shift
+            [ $# -eq 0 ] || QUERY_PARTS+=("$@")
+            break
+            ;;
         -*)
-            ARGS+=("$1")
+            # --no-color, -d, --debug, --x=v, and anything unknown: the engine rejects what it
+            # does not know with exit 2.
+            FWD+=("$1")
             shift
             ;;
         *)
@@ -55,120 +244,162 @@ while [ $# -gt 0 ]; do
     esac
 done
 
+if $WANT_VERSION; then
+    require_engine
+    # With what was forwarded, because --version --json is the engine's to answer.
+    exec python3 "$SEARCH_PY" ${FWD[@]+"${FWD[@]}"} --version
+fi
+
+if $FZF_MODE && $RESUME_SET; then
+    usage_fail "--fzf can't be used with --resume."
+fi
+if [ -n "$MODE_TOKEN" ]; then
+    if $FZF_MODE; then
+        usage_fail "--fzf can't be used with $MODE_TOKEN."
+    fi
+    if $RESUME_SET; then
+        usage_fail "--resume can't be used with $MODE_TOKEN."
+    fi
+fi
+
+# ─── Resume ──────────────────────────────────────────────
+
+if $RESUME_SET; then
+    if [[ "$RESUME_VALUE" =~ $UUID_RE ]]; then
+        if [ ${#QUERY_PARTS[@]} -gt 0 ]; then
+            usage_fail "--resume with a session ID takes no query."
+        fi
+        require_engine
+        # An exact lookup, because `claude --resume` would start empty on an unknown ID. Not --json:
+        # that mode reports the failure as a JSON document, and a person reads this one.
+        python3 "$SEARCH_PY" --preview "$RESUME_VALUE" ${FWD[@]+"${FWD[@]}"} >/dev/null || exit $?
+        resume_session "$RESUME_VALUE"
+    fi
+    if ! [[ "$RESUME_VALUE" =~ $RESULT_NUMBER_RE ]]; then
+        usage_fail "--resume needs a result number or a full session ID, not '$RESUME_VALUE'."
+    fi
+    require_engine
+    # stdout is one bare session ID; stderr stays the caller's, so errors and warnings reach it.
+    SESSION_ID="$(python3 "$SEARCH_PY" --resume-result "$RESUME_VALUE" ${FWD[@]+"${FWD[@]}"} -- ${QUERY_PARTS[@]+"${QUERY_PARTS[@]}"})" || exit $?
+    resume_session "$SESSION_ID"
+fi
+
+require_engine
+
+# ─── Search ──────────────────────────────────────────────
+
+if ! $FZF_MODE; then
+    exec python3 "$SEARCH_PY" ${FWD[@]+"${FWD[@]}"} -- ${QUERY_PARTS[@]+"${QUERY_PARTS[@]}"}
+fi
+
+# ─── fzf Picker ──────────────────────────────────────────
+
+if ! command -v fzf >/dev/null 2>&1; then
+    {
+        echo "--fzf needs fzf."
+        echo
+        echo "Install it:"
+        echo "    brew install fzf"
+        echo
+        echo "Search without the picker:"
+        echo '    claude-search "<QUERY>"'
+    } >&2
+    exit 1
+fi
+
+if ! [ -t 0 ] || ! [ -t 2 ] || [ -n "${CI:-}" ] || [ -n "${CLAUDECODE:-}" ] \
+    || $NON_INTERACTIVE || [ "${SESSION_SEARCH_ACCESSIBLE:-}" = 1 ]; then
+    {
+        echo "claude-search: --fzf needs an interactive terminal."
+        echo
+        echo "Search without the picker:"
+        echo '    claude-search "<QUERY>"'
+    } >&2
+    exit 2
+fi
+
 QUERY="${QUERY_PARTS[*]:-}"
 
-# ─── Resume Mode ───────────────────────────────────────────
-
-if [ -n "$RESUME_N" ]; then
-    # Build args for --resume-result
-    RESUME_ARGS=(--resume-result "$RESUME_N")
-    if [ ${#ARGS[@]} -gt 0 ]; then
-        RESUME_ARGS+=("${ARGS[@]}")
-    fi
-    if [ -n "$QUERY" ]; then
-        RESUME_ARGS+=("$QUERY")
-    fi
-
-    SESSION_ID=$(python3 "$SEARCH_PY" "${RESUME_ARGS[@]}" 2>&1)
-    EXIT_CODE=$?
-
-    if [ $EXIT_CODE -ne 0 ]; then
-        echo "$SESSION_ID" >&2
-        exit 1
-    fi
-
-    if [ -n "$SESSION_ID" ]; then
-        echo "Resuming session: $SESSION_ID"
-        exec claude --resume "$SESSION_ID"
-    fi
-    exit 0
+printf -v SP_Q '%q' "$SEARCH_PY"
+ARGS_Q=""
+if [ ${#FWD[@]} -gt 0 ]; then
+    printf -v ARGS_Q '%q ' "${FWD[@]}"
 fi
 
-# ─── Stats Mode ──────────────────────────────────────────
+ROWS_FILE="$(mktemp "${TMPDIR:-/tmp}/claude-search.XXXXXX")"
+trap 'rm -f "$ROWS_FILE"' EXIT
 
-if [[ " ${ARGS[*]:-} " =~ " --stats " ]]; then
-    python3 "$SEARCH_PY" --stats
-    exit 0
+# An empty query has nothing to search for yet, and the engine refuses one: the picker starts empty
+# and the reload bind fills it as the user types. A failed search stops here, before fzf draws.
+if [ -n "$QUERY" ]; then
+    __SESSION_SEARCH_PICKER=1 python3 "$SEARCH_PY" --format=fzf ${FWD[@]+"${FWD[@]}"} -- "${QUERY_PARTS[@]}" >"$ROWS_FILE" || exit $?
 fi
 
-# ─── Preview Mode ────────────────────────────────────────
+# SHELL: fzf runs binds with it, and %q above is bash quoting, whatever the login shell is.
+# __SESSION_SEARCH_PICKER: every child inherits it, so feed and preview keep their colors.
+rc=0
+OUT="$(
+    SHELL=/bin/bash __SESSION_SEARCH_PICKER=1 fzf --ansi \
+        --delimiter='\t' \
+        --with-nth=1 \
+        --expect=ctrl-y \
+        --preview="python3 $SP_Q --preview {-1}" \
+        --preview-window=right:55%:wrap \
+        --header="Enter: resume | Ctrl-Y: copy ID | Ctrl-O: open project" \
+        --bind="ctrl-o:execute(p=\$(python3 $SP_Q --json --preview {-1} 2>/dev/null | jq -r '.session.project_path // empty'); [ -n \"\$p\" ] && open \"\$p\")" \
+        --bind="change:reload:python3 $SP_Q --format=fzf --no-log ${ARGS_Q}-- {q} 2>/dev/null || true" \
+        --query="$QUERY" \
+        --color="pointer:#22c55e,prompt:#7c3aed,hl:#d4af37,hl+:#d4af37" \
+        --prompt="Search sessions > " \
+        --height=80% \
+        --layout=reverse \
+        <"$ROWS_FILE"
+)" || rc=$?
 
-for i in "${!ARGS[@]}"; do
-    if [ "${ARGS[$i]}" = "--preview" ]; then
-        python3 "$SEARCH_PY" --preview "${ARGS[$((i+1))]}"
+# Nothing below may leave this to the trap: exec runs no EXIT trap.
+rm -f "$ROWS_FILE"
+trap - EXIT
+
+case "$rc" in
+    0) ;;
+    1)
+        echo "No session selected." >&2
         exit 0
-    fi
-done
+        ;;
+    130)
+        echo "Canceled." >&2
+        exit 130
+        ;;
+    *)
+        exit "$rc"
+        ;;
+esac
 
-# ─── JSON Mode ───────────────────────────────────────────
+# --expect prints the key on the first line (empty for Enter) and the selected row on the second.
+KEY="${OUT%%$'\n'*}"
+ROW=""
+case "$OUT" in
+    *$'\n'*) ROW="${OUT#*$'\n'}" ;;
+esac
+# The session ID is the row's last tab-separated field.
+SESSION_ID="${ROW##*$'\t'}"
 
-if [[ " ${ARGS[*]:-} " =~ " --json " ]]; then
-    python3 "$SEARCH_PY" --format=json ${ARGS[@]+"${ARGS[@]}"} "$QUERY"
-    exit 0
+if [ -z "$SESSION_ID" ]; then
+    echo "claude-search: fzf returned no selection." >&2
+    exit 1
 fi
 
-# ─── fzf Interactive Mode ────────────────────────────────
-
-if $FZF_MODE; then
-    if ! command -v fzf &>/dev/null; then
-        echo "Error: fzf not installed. Install with: brew install fzf" >&2
+if [ "$KEY" = ctrl-y ]; then
+    if ! printf '%s' "$SESSION_ID" | pbcopy; then
+        echo "claude-search: Couldn't copy session ID $SESSION_ID." >&2
         exit 1
     fi
-
-    INITIAL_QUERY="$QUERY"
-
-    SELECTED=$(
-        python3 "$SEARCH_PY" --format=fzf ${ARGS[@]+"${ARGS[@]}"} "$INITIAL_QUERY" 2>/dev/null | \
-        fzf --ansi \
-            --delimiter='\t' \
-            --with-nth=1 \
-            --preview="python3 '$SEARCH_PY' --preview {-1}" \
-            --preview-window=right:55%:wrap \
-            --header="Enter: resume session | Ctrl-Y: copy ID | Ctrl-O: open transcript" \
-            --bind="ctrl-y:execute-silent(echo -n {-1} | pbcopy)+abort" \
-            --bind="ctrl-o:execute(open \$(python3 '$SEARCH_PY' --format=json --preview {-1} 2>/dev/null | jq -r '.project_path // empty'))" \
-            --bind="change:reload:python3 '$SEARCH_PY' --format=fzf ${ARGS[*]+${ARGS[*]}} {q} 2>/dev/null || true" \
-            --query="$INITIAL_QUERY" \
-            --color="pointer:#22c55e,prompt:#7c3aed,hl:#d4af37,hl+:#d4af37" \
-            --prompt="Search sessions > " \
-            --height=80% \
-            --layout=reverse \
-        || true
-    )
-
-    if [ -n "$SELECTED" ]; then
-        # Extract session_id (last tab-separated field)
-        SESSION_ID=$(echo "$SELECTED" | awk -F'\t' '{print $NF}' | tr -d '[:space:]')
-        # A workflow result (wf_…) is a file, not a session: show it instead of resuming.
-        if [[ "$SESSION_ID" == wf_* ]]; then
-            python3 "$SEARCH_PY" --preview "$SESSION_ID"
-            exit 0
-        fi
-        if [ -n "$SESSION_ID" ]; then
-            echo "Resuming session: $SESSION_ID"
-            exec claude --resume "$SESSION_ID"
-        fi
-    fi
+    echo "Copied session ID $SESSION_ID" >&2
     exit 0
 fi
 
-# ─── Standard Search Mode ────────────────────────────────
+case "$SESSION_ID" in
+    wf_*) exec python3 "$SEARCH_PY" --preview "$SESSION_ID" ;;
+esac
 
-if [ -z "$QUERY" ]; then
-    echo "Usage: claude-search [--fzf] [--resume N] [--after DATE] [--project NAME] \"query\""
-    echo ""
-    echo "Options:"
-    echo "  --fzf              Interactive fzf picker"
-    echo "  --resume N         Resume result #N (with query or from last search)"
-    echo "  --after YYYY-MM-DD Filter by date"
-    echo "  --before YYYY-MM-DD Filter by date"
-    echo "  --project NAME     Filter by project"
-    echo "  --limit N          Max results (default 10)"
-    echo "  --min-msgs N       Minimum message count"
-    echo "  --json             JSON output"
-    echo "  --stats            Index statistics"
-    echo "  --preview ID       Preview a session"
-    exit 0
-fi
-
-python3 "$SEARCH_PY" ${ARGS[@]+"${ARGS[@]}"} "$QUERY"
+resume_session "$SESSION_ID"

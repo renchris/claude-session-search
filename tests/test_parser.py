@@ -152,12 +152,14 @@ class ParserTest(unittest.TestCase):
             args, _, _, err = run_parser(f"--format={value}", "q")
             self.assertEqual((args.format, err), (value, ""))
 
-    def test_resume_path_never_warns(self):
-        # The wrapper's 2>&1 capture would take a warning line as the session ID.
-        args, code, _, err = run_parser(
+    def test_resume_path_warns_on_stderr_only(self):
+        # The wrapper captures stdout alone as the session ID, so stderr is free for warnings.
+        args, code, out, err = run_parser(
             "--resume-result", "1", "--after", "1d", "--limit", "500", "q"
         )
-        self.assertEqual((args.limit, code, err), (200, None, ""))
+        self.assertEqual((args.limit, code, out), (200, None, ""))
+        self.assertIn("--after is deprecated. Use --since.", err)
+        self.assertIn("--limit clamped to 200.", err)
 
     def test_boolean_forms(self):
         for name, dest in (("explain", "explain"), ("deep-search", "deep_search")):

@@ -730,7 +730,7 @@ def validate_args(parser: argparse.ArgumentParser, args: argparse.Namespace) -> 
         if active
     ]
     problems = []
-    # any(), not truth of the list: bin/claude-search passes an empty "" query with --analytics.
+    # any(), not truth of the list: an empty "" word is no query, as in --analytics "".
     if active_modes and any(args.query):
         problems.append(f"{active_modes[0]} takes no query.")
     if args.fails and not args.analytics:
@@ -749,10 +749,6 @@ def validate_args(parser: argparse.ArgumentParser, args: argparse.Namespace) -> 
     clamped = args.limit > LIMIT_CAP
     if clamped:
         args.limit = LIMIT_CAP
-    # bin/claude-search captures this path with 2>&1 and treats the result as the session ID,
-    # so a warning line here would break the resume.
-    if args.resume_result is not None:
-        return
     deprecated = []
     if args.format == "json":
         deprecated.append("--format json is deprecated. Use --json.")

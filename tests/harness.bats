@@ -116,7 +116,7 @@ fails() {
 
 @test "fzf stub: recognizes the reload bind bin/claude-search really passes" {
     use_stub_engine
-    FZF_RUN_RELOAD='typed words' run claude-search --fzf seed
+    FZF_RC=1 FZF_RUN_RELOAD='typed words' run run_in_pty claude-search --fzf seed
     [ "$status" -eq 0 ]
     calls engine | grep -Fx 'typed words'
 }

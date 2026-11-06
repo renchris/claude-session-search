@@ -12,12 +12,15 @@ Set Theme "Catppuccin Mocha"
 Set TypingSpeed 60ms
 
 # --- setup (hidden): point HOME at the synthetic index, clean prompt ---
+# CI and CLAUDECODE go too: bin/claude-search refuses --fzf under either, and demo.yml runs with CI=true.
 Hide
 Type "export HOME=/tmp/claude-search-demo-home"
 Enter
 Type 'export PATH="$HOME/.claude/bin:$PATH"'
 Enter
 Type 'export PS1="\$ "'
+Enter
+Type "unset CI CLAUDECODE"
 Enter
 Type "clear"
 Enter

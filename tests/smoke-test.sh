@@ -1,10 +1,23 @@
 #!/bin/bash
 # Smoke test for claude-session-search.
 # Verifies DB, FTS5, search, hooks, and cleanup.
+#
+# Hermetic: runs a copy of bin/ and hooks/ against the synthetic demo DB under a scratch $HOME, so
+# the real ~/.claude is never read or written.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_DIR="$(dirname "$SCRIPT_DIR")"
+SCRATCH="$(mktemp -d "${TMPDIR:-/tmp}/css-smoke.XXXXXX")"
+trap 'rm -rf "$SCRATCH"' EXIT
+export HOME="$SCRATCH"
+# SESSION_SEARCH_REPO would point the engine's freshness check at a real backfill.
+unset SESSION_SEARCH_REPO SESSION_SEARCH_PYTHON_DEPS ANTHROPIC_API_KEY
+mkdir -p "$HOME/.claude/bin" "$HOME/.claude/hooks"
+cp -R "$REPO_DIR/bin/." "$HOME/.claude/bin/"
+cp -R "$REPO_DIR/hooks/." "$HOME/.claude/hooks/"
+python3 "$REPO_DIR/assets/demo/build_demo_db.py" "$HOME/.claude/session-index.db" >/dev/null
+
 DB="$HOME/.claude/session-index.db"
 SEARCH_PY="$HOME/.claude/bin/session-search.py"
 PASS=0

@@ -3,20 +3,50 @@
 # Sources Claude Code terminal UX patterns: braille spinners, inline progress,
 # ANSI styling, clean phase transitions.
 #
-# Usage:
-#   source "$(dirname "$0")/lib/progress-ui.sh"
+# Usage, from a script that knows where the repo is (a script's own $0 may be a symlink in
+# ~/.claude/bin, so never build this path from $0):
+#   source "$REPO_DIR/scripts/lib/progress-ui.sh"
 #
-# Non-TTY fallback: all functions degrade to clean plain text when stdout
-# is not a terminal (pipes, redirects, cron).
+# Plain mode (stdout is not a rich terminal: pipes, redirects, cron, TERM=dumb, or accessible mode,
+# SESSION_SEARCH_ACCESSIBLE=1) prints the rows that record a result, in words at column 0. Pending and
+# in-progress rows print nothing there, unless a caller sets _UI_PHASE_LINES=true after sourcing to
+# get one line per phase.
+#
+# Colour is decided separately from rich rendering: NO_COLOR removes colour on a terminal and keeps
+# the redraw and cursor control, and FORCE_COLOR on a pipe sets the colour variables but never turns
+# on rich rendering. Colour variables hold escape text, so print them with %b.
+
+# ─── Shared CLI contract ─────────────────────────────────────
+# Beside this file on disk, whatever symlink or working directory reached it.
+
+_ui_lib_path="${BASH_SOURCE[0]}"
+while [ -L "$_ui_lib_path" ]; do
+    _ui_lib_link="$(readlink "$_ui_lib_path")"
+    case "$_ui_lib_link" in
+        /*) _ui_lib_path="$_ui_lib_link" ;;
+        *) _ui_lib_path="$(dirname "$_ui_lib_path")/$_ui_lib_link" ;;
+    esac
+done
+_ui_lib_path="$(dirname "$_ui_lib_path")/cli-common.sh"
+if [ ! -f "$_ui_lib_path" ]; then
+    printf "Error: Can't load %s. The file is missing.\n" "$_ui_lib_path" >&2
+    return 1
+fi
+# shellcheck source=/dev/null
+source "$_ui_lib_path"
 
 # ─── Terminal Detection ──────────────────────────────────────
 
+# True when stdout may take redraws, cursor control and boxes. Accessible mode never does (R121, R186).
 _UI_IS_TTY=false
-[ -t 1 ] && _UI_IS_TTY=true
+if css_rich 1 && [ "${SESSION_SEARCH_ACCESSIBLE:-}" != 1 ]; then
+    _UI_IS_TTY=true
+fi
 
 # ─── ANSI Codes ──────────────────────────────────────────────
 
-if $_UI_IS_TTY; then
+# Colour on stdout.
+if css_color_enabled 1; then
     _B='\033[1m'       # Bold
     _D='\033[2m'       # Dim
     _R='\033[0m'       # Reset
@@ -24,6 +54,21 @@ if $_UI_IS_TTY; then
     _RD='\033[31m'     # Red
     _Y='\033[33m'      # Yellow
     _C='\033[36m'      # Cyan
+else
+    _B='' _D='' _R='' _G='' _RD='' _Y='' _C=''
+fi
+
+# Colour on stderr, which resolves its own capabilities, for styled lines sent with >&2.
+if css_color_enabled 2; then
+    _E_RD='\033[31m'   # Red
+    _E_C='\033[36m'    # Cyan
+    _E_R='\033[0m'     # Reset
+else
+    _E_RD='' _E_C='' _E_R=''
+fi
+
+# Cursor control on stdout, tied to rich rendering rather than to colour.
+if $_UI_IS_TTY; then
     _CL='\033[K'       # Clear to end of line
     _UP='\033[1A'      # Move cursor up 1 line
     _SAVE='\033[s'     # Save cursor position
@@ -31,9 +76,35 @@ if $_UI_IS_TTY; then
     _HIDE='\033[?25l'  # Hide cursor
     _SHOW='\033[?25h'  # Show cursor
 else
-    _B='' _D='' _R='' _G='' _RD='' _Y='' _C='' _CL=''
-    _UP='' _SAVE='' _RESTORE='' _HIDE='' _SHOW=''
+    _CL='' _UP='' _SAVE='' _RESTORE='' _HIDE='' _SHOW=''
 fi
+
+# ─── Glyphs ──────────────────────────────────────────────────
+# The one glyph set for status rows, coloured where colour is on. Print with %b. Empty in plain mode,
+# where a row says the same thing in words.
+
+if $_UI_IS_TTY; then
+    _UI_SYM_DONE="${_G}✓${_R}"
+    _UI_SYM_FAIL="${_RD}✗${_R}"
+    _UI_SYM_PENDING="${_D}○${_R}"
+    _UI_SYM_ACTIVE="${_C}⠹${_R}"
+else
+    _UI_SYM_DONE='' _UI_SYM_FAIL='' _UI_SYM_PENDING='' _UI_SYM_ACTIVE=''
+fi
+
+# ─── Plain Phase Lines ───────────────────────────────────────
+# ui_phase_active runs inside per-item loops, so plain mode prints one line per label, and only for a
+# caller that asks. The scheduled backfill pipes into `head -50`, so this stays off by default.
+
+_UI_PHASE_LINES=false
+_UI_LAST_PHASE=""
+
+_ui_phase_line() {
+    $_UI_PHASE_LINES || return 0
+    [ "$1" != "$_UI_LAST_PHASE" ] || return 0
+    _UI_LAST_PHASE="$1"
+    printf '%s: started\n' "$1"
+}
 
 # ─── Braille Spinner ─────────────────────────────────────────
 
@@ -108,15 +179,15 @@ _ui_now() {
 _UI_BOX_W=50
 
 _ui_box_top() {
-    printf '  ╭'; printf '─%.0s' $(seq 1 $_UI_BOX_W); printf '╮\n'
+    printf '  ╭'; printf '─%.0s' $(seq 1 "$_UI_BOX_W"); printf '╮\n'
 }
 
 _ui_box_mid() {
-    printf '  ├'; printf '─%.0s' $(seq 1 $_UI_BOX_W); printf '┤\n'
+    printf '  ├'; printf '─%.0s' $(seq 1 "$_UI_BOX_W"); printf '┤\n'
 }
 
 _ui_box_bot() {
-    printf '  ╰'; printf '─%.0s' $(seq 1 $_UI_BOX_W); printf '╯\n'
+    printf '  ╰'; printf '─%.0s' $(seq 1 "$_UI_BOX_W"); printf '╯\n'
 }
 
 _ui_box_row() {
@@ -151,7 +222,7 @@ ui_header() {
     local title="$1" detail="${2:-}"
     if ! $_UI_IS_TTY; then
         echo ""
-        echo "  $title${detail:+  $detail}"
+        echo "$title${detail:+  $detail}"
         echo ""
         return
     fi
@@ -187,7 +258,10 @@ ui_phase_pending() {
 # Call repeatedly in a loop. START_MS from _ui_now.
 ui_phase_active() {
     local label="$1" current="$2" total="$3" start_ms="$4"
-    if ! $_UI_IS_TTY; then return; fi
+    if ! $_UI_IS_TTY; then
+        _ui_phase_line "$label"
+        return
+    fi
     local s=$(_ui_spin)
     local bar=$(_ui_bar "$current" "$total" 20)
     local elapsed=$(_ui_elapsed "$start_ms")
@@ -203,7 +277,10 @@ ui_phase_active() {
 # For phases without a known total — shows spinner + detail text.
 ui_phase_active_simple() {
     local label="$1" detail="$2" start_ms="$3"
-    if ! $_UI_IS_TTY; then return; fi
+    if ! $_UI_IS_TTY; then
+        _ui_phase_line "$label"
+        return
+    fi
     local s=$(_ui_spin)
     local elapsed=$(_ui_elapsed "$start_ms")
     printf '\r  %b◐%b %b%s%b  %s %s  %b%ss%b%b' \
@@ -217,7 +294,7 @@ ui_phase_done() {
     local label="$1" detail="$2" start_ms="$3"
     local elapsed=$(_ui_elapsed "$start_ms")
     if ! $_UI_IS_TTY; then
-        echo "  ✓ $label  $detail  ${elapsed}s"
+        echo "$label: done${detail:+, $detail} (${elapsed}s)"
         return
     fi
     printf '\r  %b●%b %b%s%b  %b✓ %s%b  %b%ss%b%b\n' \
@@ -229,12 +306,12 @@ ui_phase_done() {
 # ui_phase_skip LABEL REASON
 # Shows a skipped phase.
 ui_phase_skip() {
-    local label="$1" reason="${2:-skipped}"
+    local label="$1" reason="${2:-}"
     if ! $_UI_IS_TTY; then
-        echo "  ○ $label  ($reason)"
+        echo "$label: skipped${reason:+ ($reason)}"
         return
     fi
-    printf '  %b○ %s  %s%b\n' "$_D" "$label" "$reason" "$_R"
+    printf '  %b○ %s  %s%b\n' "$_D" "$label" "${reason:-skipped}" "$_R"
 }
 
 # ui_item_ok ID DETAIL [EXTRA]
@@ -242,11 +319,11 @@ ui_phase_skip() {
 ui_item_ok() {
     local id="$1" detail="$2" extra="${3:-}"
     if ! $_UI_IS_TTY; then
-        echo "    ✓ ${id:0:8}  $detail"
+        echo "${id:0:8}: ok${detail:+, $detail}"
         return
     fi
-    printf '\r%b  %b✓%b %b%-8s%b  %-40s  %b%s%b\n' \
-        "$_CL" "$_G" "$_R" "$_C" "${id:0:8}" "$_R" \
+    printf '\r%b  %b %b%-8s%b  %-40s  %b%s%b\n' \
+        "$_CL" "$_UI_SYM_DONE" "$_C" "${id:0:8}" "$_R" \
         "${detail:0:40}" "$_D" "${extra:0:50}" "$_R"
 }
 
@@ -255,11 +332,11 @@ ui_item_ok() {
 ui_item_fail() {
     local id="$1" reason="$2"
     if ! $_UI_IS_TTY; then
-        echo "    ✗ ${id:0:8}  $reason"
+        echo "Error: ${id:0:8}: $reason"
         return
     fi
-    printf '\r%b  %b✗%b %b%-8s%b  %b%s%b\n' \
-        "$_CL" "$_RD" "$_R" "$_D" "${id:0:8}" "$_R" \
+    printf '\r%b  %b %b%-8s%b  %b%s%b\n' \
+        "$_CL" "$_UI_SYM_FAIL" "$_D" "${id:0:8}" "$_R" \
         "$_D" "$reason" "$_R"
 }
 
@@ -270,9 +347,9 @@ ui_summary() {
     local elapsed_label="$1"; shift
     if ! $_UI_IS_TTY; then
         echo ""
-        echo "  $title  $elapsed_label"
+        echo "$title  $elapsed_label"
         while [ $# -ge 2 ]; do
-            echo "  $1  $2"
+            echo "$1: $2"
             shift 2
         done
         echo ""
@@ -315,6 +392,14 @@ ui_cursor_hide() {
 
 ui_cursor_show() {
     $_UI_IS_TTY && printf '%b' "$_SHOW" || true
+}
+
+# ui_cursor_up N
+# Moves the cursor up N lines for an in-place redraw. Nothing in plain mode.
+ui_cursor_up() {
+    if $_UI_IS_TTY; then
+        printf '\033[%dA' "$1"
+    fi
 }
 
 # ─── Update Throttle ─────────────────────────────────────────

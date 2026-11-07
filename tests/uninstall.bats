@@ -349,7 +349,7 @@ JSON
     # A held lock is a failure css_settings_patch reports after its timeout.
     mkdir "$SETTINGS.lock.d"
     before="$(cksum <"$SETTINGS")"
-    run --separate-stderr "$REPO/uninstall.sh"
+    run --separate-stderr env __SESSION_SEARCH_LOCK_TRIES=3 "$REPO/uninstall.sh"
     [ "$status" -eq 1 ]
     has "$stderr" "ERROR: could not edit $SETTINGS; left unchanged"
     lacks "$output" "Hook entries removed"

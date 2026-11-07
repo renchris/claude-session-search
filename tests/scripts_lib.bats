@@ -408,7 +408,7 @@ STUB
 @test "settings patch gives up on a held lock, writes nothing and leaves the lock alone" {
     mkdir "$SETTINGS.lock.d"
     tree_snapshot
-    run --separate-stderr "$LIB" 'css_settings_patch "$1" ".a = 1"' "$SETTINGS"
+    run --separate-stderr env __SESSION_SEARCH_LOCK_TRIES=3 "$LIB" 'css_settings_patch "$1" ".a = 1"' "$SETTINGS"
     [ "$status" -eq 1 ]
     case "$stderr" in *"rmdir "*/.claude/settings.json.lock.d) ;; *) echo "stderr: $stderr" >&2; return 1 ;; esac
     assert_tree_unchanged

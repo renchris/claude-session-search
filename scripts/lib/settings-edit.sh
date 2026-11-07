@@ -6,7 +6,9 @@
 # during a patch can leave the lock directory behind; the timeout message names it and says how to
 # clear it. Failures return 1 rather than exit, so the caller chooses how to report them.
 
-_CSS_SETTINGS_LOCK_TRIES=50    # 5 seconds, at 0.1s each
+# Attempts, at 0.1s plus a python3 start each: at least 30 seconds, because a loaded machine can take
+# seconds per patch and a queue of them must not read as a stuck lock. Tests shorten it.
+_CSS_SETTINGS_LOCK_TRIES="${__SESSION_SEARCH_LOCK_TRIES:-300}"
 _CSS_SETTINGS_WRITE_ATTEMPTS=3 # Claude Code takes no lock, so it can write at any moment
 
 # True when the file holds exactly one JSON object. `jq empty` alone passes an empty file, `{} {}`

@@ -1,4 +1,10 @@
+---
+status: in-progress
+---
+
 # Remediation plan: claude-session-search (CLI design guidelines, vendor-neutral)
+
+> Status 2026-11-07: Waves A and B landed (record in §8). Open: Wave C decisions (§4, all filed) and the width follow-up unit (§8.3).
 
 Inputs: 25 verified findings (unit `claude-search`; verifier dropped none; none Vercel-specific), /tmp/cli-bp/checklist.md, /tmp/cli-bp/guidelines.md.
 Method: static reading only. No CLI under audit was executed. Line numbers are from `main` @ b765dda.
@@ -1759,3 +1765,53 @@ Counted from the §6 table: from 11 units and about 2850 LOC to 28 units and abo
 - LOC figures are estimates, summed per cited range, at about 10-15 test lines per case. None was measured by implementing.
 - The "Execution locus" stays in §6 rather than becoming a new first section, because this round may not rewrite the section list.
 - The hooks' own CLI-rule exposure (session-index-sweep.sh BSD `stat`, helpers:472) is flagged in B16.4, not planned.
+
+---
+
+## 8. Implementation record (2026-11-06 to 2026-11-07)
+
+**Execution locus used:** T (in-session named teammates, one per unit, each in its own worktree), not the S default in §6, because the brief for this run asked for one team led in one session. Every unit was gated with G1-G7 (`/tmp/css-cli/gates.sh`, which asserts the unittest summary and the TAP plan line) and landed by rebase and fast-forward push, verified by `git ls-tree origin/main` and an empty `git diff` on the changed paths. Direct to `main`, no PR (no repo rule requires one).
+
+### 8.1 Landed units
+
+| Unit | Landed on `main` | Notes |
+|---|---|---|
+| plan copy | f9737fd | this file |
+| U1a | 98aa893 | |
+| U2 | ce525f5 | |
+| U11b | bfe6f89 | VERSION 0.1.0 (C15 default A) |
+| U1b | 7817e05 | |
+| U17 | d511b1f | |
+| U11a | f97c187 | |
+| U18 | 53d5640 | |
+| U15 | 3ce3921 | |
+| U13 | 2e92dd7 | |
+| U12, U3, U6 | 328455f | one push: U3 and U6 had to land together (the wrapper's `2>&1` resume capture) |
+| U19 | 4053faa | |
+| U14 | 15cc602 | |
+| U4 | 4f77d5e | |
+| U20, U16 | 0fbe18c | one push, after a red gate run was traced to a lock-timeout flake |
+| U5 | f57deda | |
+| U21 | see git log | landed by the lead; teammate stopped at its account's weekly limit |
+| U7 | see git log | written by the lead; the capacity gate refused its teammate |
+
+Fixes landed between units, each with its own commit: 57e7101 (ruff.toml: exempt the three legacy Python files from `ruff format`, because the post-edit formatter hook rewrote whole files), 94b032c (CI: workflow-index test macOS only), 95dfa44 (settings lock: `os.mkdir`, see 8.3), 2babb11 (settings lock waits at least 30 s).
+
+### 8.2 Wave C: kept as today, per decision packet ad226c7513ea (default "keep", unanswered at landing)
+
+Every Wave C row (C1-C21) needs an operator decision, so none was implemented. Where the keep option adds help text, it landed: each CLI's help lists its exit codes, and README.md has the exit-code, option and environment tables. Each decision the packet does not settle was filed once as class B, default keep, no-change: C1 (removal date for `--format json`), C3, C4, C5, C10, C11, C12, C14, C15, C16, C17, C18, C19, C20, C21. C6, C7, C8 and C9 are covered by the packet itself.
+
+### 8.3 Recorded conflicts and findings (callers kept working; nothing widened)
+
+- **C18, new evidence:** config/com.claude.session-search-backfill.plist:11 has a bare `&` (`2>&1`), so the file is invalid XML (`plutil -lint`); launchctl likely cannot load it, and install.sh:257-259 hides that behind `|| true`. Kept byte-identical; tests/backfill_cli.bats `"repo plist parses"` is a `skip` naming C18 until it is decided.
+- **uutils `mkdir` on ubuntu-latest exits 0 when it loses a race** (measured under strace on the runner: two processes both "won"). The settings lock now uses `os.mkdir` (scripts/lib/settings-edit.sh). The helpers' own `mkdir` lock (hooks/lib/session-index-helpers.sh, flock-absent hosts) has the same exposure on Linux; C10 owns that primitive.
+- **workflow-index-test.sh** can't pass on Linux: hooks/session-index-sweep.sh uses BSD `stat -f`. It runs only in the macOS CI entry.
+- **Width (B21.3, R211):** tests/test_transcripts.py `KNOWN_WIDTH_FAILURES` lists the views that overflow today: stats box (fixed width 52), preview prose (unwrapped), tagger banner/bars/summary at 40 and one 82-column line at 80, installer box and rows at 40, the tagger banner row 2 columns wider than its border, and a wrapped installer row at 40 that `\r` plus erase-line cannot clear. Each entry names its file:line. The list is exact, so a fix must remove its entry. **Open follow-up unit:** fix those views, emptying the list (fits B5.1 for the engine views, B19.4 for the tagger, B13.2 for the installer).
+- **R191:** the table and preview keep 8-character IDs (C2's second question, kept).
+- **R205:** plain piped output keeps Unicode box glyphs; glyphs become words only in accessible mode.
+- **B6.5:** `--resume <uuid>` checks the ID with plain `--preview` (not `--json --preview`), so a not-found error is human text.
+- **B19.1/B19.3 vs B19.4:** the non-TTY `Done in ...` line became `Tagged N of M sessions in ...` (B19.4, the later row); no reader of the old line exists.
+- **B20.1:** under `--json`, `no_match` and `empty_text` rows count as skipped, not failed, because they recur every run (§4 C6 tag.py note); `failed>0` exits 1 under `--json` only.
+- **B14.2:** "corrupted during patching" is gone: the patch validates before an atomic `mv`, so the file is never corrupted by the patch. The message is "Can't patch settings.json: <why>. The file was not changed."
+- **REASONS registry (R255):** the tagger's `lock_held`, `lock_failed` and `not_persisted` are outside the engine's registry, because the engine stays one copied file.
+- **B6.3:** help's `--no-llm` note became true with U5 (landed after U6).

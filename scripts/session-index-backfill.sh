@@ -1,5 +1,5 @@
 #!/bin/bash
-# One-time idempotent backfill of session index from all data sources.
+# Idempotent backfill, run at install, weekly by launchd, and on stale index.
 # Usage and options: session-index-backfill.sh --help
 set -euo pipefail
 
@@ -17,7 +17,12 @@ Options:
       --enrich-only   Skip discovery and only re-extract enrichment.
       --if-idle       Exit 0 without running if another run holds the index
                       lock, and log the skip. Default: wait for the lock.
-      --quiet         Accepted, with no effect: the output stays the same.
+      --json          Print one JSON document on stdout with the phase counts, and
+                      send the progress to stderr. On failure, ok is false.
+      --no-color      Print no color.
+      --quiet         Hide the database line and the phase-start lines. Otherwise
+                      no effect: the other output stays the same.
+  -v, --version       Print the version.
   -h, --help          Show this help.
 
 Examples:
@@ -27,15 +32,20 @@ Examples:
   session-index-backfill.sh --since 12h
   session-index-backfill.sh --since 2026-03-01
   session-index-backfill.sh --enrich-only --since 3
+  session-index-backfill.sh --json
 
 Notes:
   Needs sqlite3, jq and python3. Reads and writes ~/.claude.
+  A locked database is retried a few times, up to 60 seconds per try.
+  SESSION_INDEX_BUSY_TIMEOUT sets that wait, in milliseconds.
 
 Exit codes:
-  0              Success.
+  0              Success, or skipped by --if-idle.
   1              Failure, including a missing prerequisite or file.
   2              Usage error.
+  5              The database stayed locked. A re-run is safe.
   129, 130, 143  Stopped by HUP, INT or TERM.
+  Other          A failed step's own exit code.
 USAGE
 }
 
@@ -85,6 +95,10 @@ source "$SCRIPT_DIR/lib/cli-common.sh"
 _PROG=session-index-backfill.sh
 _enrich_flag=0
 _if_idle_flag=0
+_quiet_flag=0
+_json_flag=0
+_no_color_flag=0
+_version_flag=0
 _since_value=""
 # Parse-only stops below instead, so that a help example with a bad --since fails too.
 __SESSION_SEARCH_PARSE_ONLY='' css_parse_args "$_PROG" \
@@ -92,11 +106,82 @@ __SESSION_SEARCH_PARSE_ONLY='' css_parse_args "$_PROG" \
     "enrich-only||bool|_enrich_flag" \
     "if-idle||bool|_if_idle_flag" \
     "since|s|value|_since_value" \
+    "json||bool|_json_flag" \
+    "no-color||bool|_no_color_flag" \
+    "version|v|bool|_version_flag" \
     "help|h|bool|_help_flag" \
     -- "$@"
 ENRICH_ONLY=false
 if [ "$_enrich_flag" = 1 ]; then
     ENRICH_ONLY=true
+fi
+QUIET=false
+if [ "$_quiet_flag" = 1 ]; then
+    QUIET=true
+fi
+if [ "$_no_color_flag" = 1 ]; then
+    export __SESSION_SEARCH_NO_COLOR=1
+fi
+
+if [ "$_version_flag" = 1 ]; then
+    if [ "$_json_flag" = 1 ]; then
+        printf '{"version":"%s"}\n' "$(_css_json_escape "$(css_version "$REPO_DIR")")"
+    else
+        css_version "$REPO_DIR"
+    fi
+    exit 0
+fi
+
+# ─── --json ────────────────────────────────────────────────
+
+# The step a failure is reported against.
+_bf_phase="Startup"
+
+# The counters, as a JSON object. A skipped or unreached phase counts 0.
+_backfill_counts_json() {
+    jq -cn \
+        --argjson p1 "${phase1_count:-0}" \
+        --argjson p2 "${phase2_count:-0}" --argjson p2s "${phase2_skip:-0}" \
+        --argjson p3 "${phase3_count:-0}" \
+        --argjson p4e "${phase4_enriched:-0}" --argjson p4i "${phase4_inserted:-0}" --argjson p4s "${phase4_skipped:-0}" \
+        --argjson p4bi "${phase4b_indexed:-0}" --argjson p4bb "${phase4b_bad:-0}" \
+        --argjson p5e "${phase5_enriched:-0}" --argjson p5s "${phase5_skipped:-0}" --argjson p5n "${phase5_nofound:-0}" \
+        --argjson fts "${_fts_count:-0}" --argjson syn "${_syn_count:-0}" \
+        --argjson chunks "${_chunk_count:-0}" \
+        --argjson total "${total:-0}" --argjson untagged "${untagged:-0}" \
+        '{phases: {
+            phase1: {indexed: $p1},
+            phase2: {new: $p2, skipped: $p2s},
+            phase3: {synthetic: $p3},
+            phase4: {enriched: $p4e, inserted: $p4i, skipped: $p4s},
+            phase4b: {indexed: $p4bi, unreadable: $p4bb},
+            phase5: {enriched: $p5e, empty: $p5s, no_transcript: $p5n},
+            phase6: {fts_entries: $fts, synonyms: $syn},
+            phase7: {chunks: $chunks}
+        }, total: $total, untagged: $untagged}'
+}
+
+# The failure document on fd 3, keeping exit status RC. Does nothing without --json or on success.
+# The fallback is for a failure before jq could run; its strings are the constant phase names.
+_backfill_json_failure() {
+    local rc="$1" counts
+    if [ "$_json_flag" != 1 ] || [ "$rc" = 0 ]; then
+        return 0
+    fi
+    counts=$(_backfill_counts_json 2>/dev/null) || counts='{}'
+    jq -cn --argjson rc "$rc" --arg phase "$_bf_phase" --arg db "${SESSION_INDEX_DB:-}" \
+        --argjson counts "$counts" \
+        '{ok: false, exit_code: $rc, phase: $phase, database: $db,
+          message: "backfill failed in \($phase) (exit \($rc)). A re-run is safe."} + $counts' \
+        >&3 2>/dev/null ||
+        printf '{"ok":false,"exit_code":%d,"phase":"%s"}\n' "$rc" "$_bf_phase" >&3
+}
+
+if [ "$_json_flag" = 1 ]; then
+    export __SESSION_SEARCH_NON_INTERACTIVE=1
+    # Before progress-ui.sh is sourced, so its check of stdout sees stderr. Fd 3 holds the document.
+    exec 3>&1 1>&2
+    trap '_backfill_json_failure "$?"' EXIT
 fi
 
 _require_file "$REPO_DIR/hooks/lib/session-index-helpers.sh"
@@ -175,30 +260,94 @@ if [ "${__SESSION_SEARCH_PARSE_ONLY:-}" = 1 ]; then
     exit 0
 fi
 
+# Before the source, whose own default is 5 seconds: logged lock failures got through that default.
+# Each locked statement waits this long, and session_index_retry_busy repeats the bulk writes.
+export SESSION_INDEX_BUSY_TIMEOUT="${SESSION_INDEX_BUSY_TIMEOUT:-60000}"
+
 source "$REPO_DIR/hooks/lib/session-index-helpers.sh"
 source "$SCRIPT_DIR/lib/progress-ui.sh"
 
-# ─── Init DB ───────────────────────────────────────────────
+if [ "$QUIET" = "true" ]; then
+    # shellcheck disable=SC2034 # session_index_retry_busy reads it
+    SESSION_INDEX_RETRY_NOTICE=""
+else
+    _UI_PHASE_LINES=true
+fi
 
-session_index_init_db
+# ─── Cleanup ───────────────────────────────────────────────
+# Here and not in the helpers or the UI library, whose traps the hooks and install.sh depend on.
+
+TMPFILE=""
+_P5_TMP=""
+_BF_CHILD=""
+
+# Calls no exit, so the status survives. Errexit goes off first for the same reason.
+_backfill_cleanup() {
+    local rc=$?
+    set +e
+    if [ -n "${_BF_CHILD:-}" ]; then
+        kill "$_BF_CHILD" 2>/dev/null
+    fi
+    _ui_cleanup
+    rm -f "${TMPFILE:-}" "${_P5_TMP:-}" 2>/dev/null
+    session_index_unlock
+    _backfill_json_failure "$rc"
+}
+
+_backfill_on_signal() {
+    trap - INT TERM HUP
+    exit "$1"
+}
+
+# EXIT only for now: a signal trap would hold a stop request until the wait for the lock ends.
+trap '_backfill_cleanup' EXIT
+
+[ "$QUIET" = "true" ] || echo "Session index: $SESSION_INDEX_DB" >&2
 
 # ─── Acquire exclusive lock (blocks if tagger/another backfill is running) ───
 
 if [ "$_if_idle_flag" = 1 ]; then
     if ! session_index_trylock; then
         session_index_log "Backfill skipped: index busy"
+        if [ "$_json_flag" = 1 ]; then
+            jq -cn --arg db "$SESSION_INDEX_DB" '{ok: true, skipped: true, reason: "index_busy", database: $db}' >&3
+        fi
         exit 0
     fi
 else
     session_index_lock
 fi
 
+# The lock replaced the EXIT trap, so this has to come after it. No PIPE: the repo plist pipes this
+# script into `head -50`, and a closed pipe keeps its old meaning there.
+trap '_backfill_cleanup' EXIT
+trap '_backfill_on_signal 130' INT
+trap '_backfill_on_signal 143' TERM
+trap '_backfill_on_signal 129' HUP
+# It only adds a line: errexit still ends the run, with the failed step's status.
+_bf_rc=0
+trap '_bf_rc=$?; echo "error: backfill failed at line $LINENO (exit $_bf_rc)" >&2' ERR
+
+# ─── Init DB ───────────────────────────────────────────────
+
+session_index_init_db
+
+# A time that can't be read says nothing about age, so the row stays. Writes are repeatable, and one
+# warning per run keeps the scheduled job's output short.
+_time_warned=false
+_warn_unknown_time() {
+    if [ "$_time_warned" = false ]; then
+        _time_warned=true
+        css_warn "Can't read a session's time. Keeping it despite --since."
+    fi
+}
+
 # ─── Pre-count totals for progress tracking ────────────────
 
 _backfill_start=$(_ui_now)
 
 # Count existing sessions for the header
-_existing_total=$(sqlite3 "$SESSION_INDEX_DB" "SELECT COUNT(*) FROM sessions;" 2>/dev/null || echo 0)
+_existing_total=$(session_index_sql "SELECT COUNT(*) FROM sessions;" 2>/dev/null || echo 0)
 
 # Count transcript files for Phase 4 progress (flat + subdirectory layouts)
 _transcript_total=0
@@ -246,6 +395,7 @@ else
 
 # ─── Phase 1: sessions-index.json (highest quality) ───────
 
+_bf_phase="Phase 1: Session index scan"
 _p1_start=$(_ui_now)
 phase1_count=0
 
@@ -302,8 +452,12 @@ else
 
             # --since filter: skip sessions older than threshold
             if [ -n "$SINCE_DAYS" ] && [ -n "$modified" ] && [ "$modified" != "null" ]; then
-                mod_epoch=$(date -jf "%Y-%m-%dT%H:%M:%S" "${modified%%.*}" +%s 2>/dev/null || echo 0)
-                [ "$mod_epoch" -lt "$SINCE_EPOCH" ] && continue
+                mod_epoch=$(session_index_date_to_epoch "${modified%%.*}" 2>/dev/null || echo "")
+                if [ -z "$mod_epoch" ]; then
+                    _warn_unknown_time
+                elif [ "$mod_epoch" -lt "$SINCE_EPOCH" ]; then
+                    continue
+                fi
             fi
 
             # Use projectPath from JSON; fallback
@@ -326,7 +480,7 @@ else
             fi
 
             keywords=$(session_index_extract_keywords "$summary $first_prompt $context_text" 2>/dev/null || echo "")
-            session_index_upsert \
+            session_index_retry_busy session_index_upsert \
                 "$sid" \
                 "$project_path" \
                 "$project_name" \
@@ -354,6 +508,7 @@ fi
 
 # ─── Phase 2: history.jsonl (gap fill) ────────────────────
 
+_bf_phase="Phase 2: History gap fill"
 _p2_start=$(_ui_now)
 phase2_count=0
 phase2_skip=0
@@ -391,7 +546,7 @@ if [ -f "$CLAUDE_HISTORY" ]; then
             fi
 
             # Check if already indexed from Phase 1
-            existing=$(sqlite3 "$SESSION_INDEX_DB" "SELECT source FROM sessions WHERE session_id='$(echo "$sid" | sed "s/'/''/g")' LIMIT 1;" 2>/dev/null || echo "")
+            existing=$(session_index_sql "SELECT source FROM sessions WHERE session_id='$(echo "$sid" | sed "s/'/''/g")' LIMIT 1;" 2>/dev/null || echo "")
             if [ "$existing" = "sessions-index" ]; then
                 phase2_skip=$((phase2_skip + 1))
                 ui_should_update "$_p2_processed" "$_p2_total" && \
@@ -405,12 +560,12 @@ if [ -f "$CLAUDE_HISTORY" ]; then
             created_at=""
             if [ -n "$timestamp_ms" ] && [ "$timestamp_ms" != "0" ]; then
                 epoch_sec=$((timestamp_ms / 1000))
-                created_at=$(date -r "$epoch_sec" -u +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null || echo "")
+                created_at=$(session_index_epoch_to_iso "$epoch_sec" 2>/dev/null || echo "")
             fi
             [ -z "$created_at" ] && created_at=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
 
             keywords=$(session_index_extract_keywords "$display" 2>/dev/null || echo "")
-            session_index_upsert \
+            session_index_retry_busy session_index_upsert \
                 "$sid" \
                 "$project_path" \
                 "$project_name" \
@@ -439,6 +594,7 @@ fi
 
 # ─── Phase 3: Legacy entries (no sessionId) ───────────────
 
+_bf_phase="Phase 3: Legacy entries"
 _p3_start=$(_ui_now)
 phase3_count=0
 
@@ -498,18 +654,18 @@ if [ -f "$CLAUDE_HISTORY" ]; then
             created_at=""
             if [ -n "$first_ts" ] && [ "$first_ts" != "0" ]; then
                 epoch_sec=$((first_ts / 1000))
-                created_at=$(date -r "$epoch_sec" -u +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null || echo "")
+                created_at=$(session_index_epoch_to_iso "$epoch_sec" 2>/dev/null || echo "")
             fi
             [ -z "$created_at" ] && created_at=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
 
             modified_at="$created_at"
             if [ -n "$last_ts" ] && [ "$last_ts" != "0" ]; then
                 epoch_sec=$((last_ts / 1000))
-                modified_at=$(date -r "$epoch_sec" -u +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null || echo "$created_at")
+                modified_at=$(session_index_epoch_to_iso "$epoch_sec" 2>/dev/null || echo "$created_at")
             fi
 
             keywords=$(session_index_extract_keywords "$display" 2>/dev/null || echo "")
-            session_index_upsert \
+            session_index_retry_busy session_index_upsert \
                 "$synthetic_id" \
                 "$project_path" \
                 "$project_name" \
@@ -543,6 +699,7 @@ fi  # end --enrich-only skip
 # Scans .jsonl transcripts: updates context_text + message_count for existing rows,
 # INSERTs new rows for transcript-only sessions.
 
+_bf_phase="Phase 4: Transcript enrichment"
 _p4_start=$(_ui_now)
 phase4_enriched=0
 phase4_inserted=0
@@ -593,7 +750,7 @@ else
             # Skip if already enriched (unless --enrich-only which means force re-enrich)
             if [ "$ENRICH_ONLY" != "true" ]; then
                 _sid_check=$(echo "$sid" | sed "s/'/''/g")
-                already_enriched=$(sqlite3 "$SESSION_INDEX_DB" \
+                already_enriched=$(session_index_sql \
                     "SELECT 1 FROM sessions WHERE session_id='$_sid_check' AND length(context_text) > 0 AND length(assistant_text) > 0 LIMIT 1;" \
                     2>/dev/null || echo "")
                 if [ -n "$already_enriched" ]; then
@@ -617,10 +774,13 @@ else
             cr_escaped=$(echo "$commands_run" | sed "s/'/''/g")
             sid_escaped=$(echo "$sid" | sed "s/'/''/g")
 
-            exists=$(sqlite3 "$SESSION_INDEX_DB" "SELECT 1 FROM sessions WHERE session_id='$sid_escaped' $SINCE_FILTER LIMIT 1;" 2>/dev/null || echo "")
+            exists=$(session_index_sql "SELECT 1 FROM sessions WHERE session_id='$sid_escaped' $SINCE_FILTER LIMIT 1;" 2>/dev/null || echo "")
 
+            # These writes keep stdin, not session_index_sql: its stdin mode re-passes the SQL as one
+            # argument, and Linux caps one argument at 128 KiB, under the largest row.
             if [ -n "$exists" ]; then
                 sqlite3 "$SESSION_INDEX_DB" <<SQL
+.timeout $SESSION_INDEX_BUSY_TIMEOUT
 UPDATE sessions SET
     context_text = '$ctx_escaped',
     assistant_text = CASE WHEN '$at_escaped' != '' THEN '$at_escaped' ELSE assistant_text END,
@@ -633,11 +793,15 @@ SQL
             else
                 # --since filter for new sessions: check file mtime
                 if [ -n "$SINCE_DAYS" ]; then
-                    file_epoch=$(stat -f "%m" "$transcript" 2>/dev/null || echo 0)
-                    [ "$file_epoch" -lt "$SINCE_EPOCH" ] && continue
+                    file_epoch=$(session_index_file_epoch "$transcript" 2>/dev/null || echo "")
+                    if [ -z "$file_epoch" ]; then
+                        _warn_unknown_time
+                    elif [ "$file_epoch" -lt "$SINCE_EPOCH" ]; then
+                        continue
+                    fi
                 fi
                 now=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
-                file_mtime=$(stat -f "%Sm" -t "%Y-%m-%dT%H:%M:%SZ" "$transcript" 2>/dev/null || echo "$now")
+                file_mtime=$(session_index_file_mtime_iso "$transcript" 2>/dev/null || echo "$now")
                 first_prompt=$(echo "$context_text" | head -c 500)
                 fp_escaped=$(echo "$first_prompt" | sed "s/'/''/g")
                 pp_escaped=$(echo "$proj_path" | sed "s/'/''/g")
@@ -646,6 +810,7 @@ SQL
                 kw_escaped=$(echo "$keywords" | sed "s/'/''/g")
 
                 sqlite3 "$SESSION_INDEX_DB" <<SQL
+.timeout $SESSION_INDEX_BUSY_TIMEOUT
 INSERT OR IGNORE INTO sessions (session_id, project_path, project_name, summary, first_prompt,
     context_text, assistant_text, files_changed, commands_run,
     git_branch, created_at, modified_at, message_count, tags, keywords, source, indexed_at)
@@ -668,6 +833,7 @@ fi
 # Each becomes its OWN row keyed on the file stem (`wf_…`), with the same rules as the sweep:
 # source 'workflow-sweep', the parent's project, never the parent's row. Phase 6 rebuilds FTS.
 
+_bf_phase="Phase 4b: Workflow results"
 _p4b_start=$(_ui_now)
 phase4b_indexed=0
 phase4b_bad=0
@@ -678,8 +844,12 @@ for project_dir in "$CLAUDE_PROJECTS_DIR"/*/; do
     for wf in "$project_dir"*/workflows/wf_*.json; do
         [ -f "$wf" ] || continue
         if [ -n "$SINCE_DAYS" ]; then
-            file_epoch=$(stat -f "%m" "$wf" 2>/dev/null || echo 0)
-            [ "$file_epoch" -lt "$SINCE_EPOCH" ] && continue
+            file_epoch=$(session_index_file_epoch "$wf" 2>/dev/null || echo "")
+            if [ -z "$file_epoch" ]; then
+                _warn_unknown_time
+            elif [ "$file_epoch" -lt "$SINCE_EPOCH" ]; then
+                continue
+            fi
         fi
         extracted=$(session_index_extract_workflow "$wf" 2>/dev/null || true)
         wf_head=""; wf_text=""
@@ -689,9 +859,9 @@ for project_dir in "$CLAUDE_PROJECTS_DIR"/*/; do
             continue
         fi
         now=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
-        file_mtime=$(stat -f "%Sm" -t "%Y-%m-%dT%H:%M:%SZ" "$wf" 2>/dev/null || echo "$now")
+        file_mtime=$(session_index_file_mtime_iso "$wf" 2>/dev/null || echo "$now")
         keywords=$(session_index_extract_keywords "$wf_head $wf_text" 2>/dev/null || echo "")
-        session_index_upsert "$(basename "$wf" .json)" "$proj_path" "$proj_name" "" "$wf_head" "" \
+        session_index_retry_busy session_index_upsert "$(basename "$wf" .json)" "$proj_path" "$proj_name" "" "$wf_head" "" \
             "$file_mtime" "$file_mtime" 0 "" "$keywords" "workflow-sweep" "$wf_text" "" "" "" ""
         phase4b_indexed=$((phase4b_indexed + 1))
     done
@@ -711,13 +881,14 @@ fi
 # location, or session discovered in Phases 1-3 without a matching
 # transcript file in the standard scan paths).
 
+_bf_phase="Phase 5: Enrichment gap-fill"
 _p5_start=$(_ui_now)
 phase5_enriched=0
 phase5_skipped=0
 phase5_nofound=0
 
 # Query sessions missing assistant_text
-_p5_total=$(sqlite3 "$SESSION_INDEX_DB" \
+_p5_total=$(session_index_sql \
     "SELECT COUNT(*) FROM sessions WHERE assistant_text = '' AND session_id NOT LIKE 'legacy-%' AND session_id NOT LIKE 'wf\_%' ESCAPE '\' $SINCE_FILTER;" \
     2>/dev/null || echo 0)
 
@@ -727,9 +898,10 @@ else
     ui_phase_active "Phase 5: Enrichment gap-fill" 0 "$_p5_total" "$_p5_start"
     _p5_processed=0
 
-    # Dump session_id + project_path pairs to temp file
+    # Dump session_id + project_path pairs to temp file. Raw because the wrapper can't pass
+    # -separator, and this is the one recorded exception to its rule.
     _P5_TMP=$(mktemp)
-    sqlite3 -separator $'\t' "$SESSION_INDEX_DB" \
+    sqlite3 -separator $'\t' "$SESSION_INDEX_DB" ".timeout $SESSION_INDEX_BUSY_TIMEOUT" \
         "SELECT session_id, project_path FROM sessions WHERE assistant_text = '' AND session_id NOT LIKE 'legacy-%' AND session_id NOT LIKE 'wf\_%' ESCAPE '\' $SINCE_FILTER;" \
         > "$_P5_TMP" 2>/dev/null || true
 
@@ -784,6 +956,7 @@ else
         sid_escaped=$(echo "$sid" | sed "s/'/''/g")
 
         sqlite3 "$SESSION_INDEX_DB" <<SQL
+.timeout $SESSION_INDEX_BUSY_TIMEOUT
 UPDATE sessions SET
     assistant_text = '$at_escaped',
     files_changed = '$fc_escaped',
@@ -803,36 +976,42 @@ fi
 
 # ─── Phase 6: Synonyms + FTS rebuild ──────────────────────
 
+_bf_phase="Phase 6: FTS rebuild"
 _p6_start=$(_ui_now)
 ui_phase_active_simple "Phase 6: FTS rebuild" "loading synonyms..." "$_p6_start"
 
 synonyms_file="$REPO_DIR/synonyms/default.json"
 _syn_count=0
 if [ -f "$synonyms_file" ]; then
-    session_index_load_synonyms "$synonyms_file"
-    _syn_count=$(sqlite3 "$SESSION_INDEX_DB" "SELECT COUNT(*) FROM synonyms;" 2>/dev/null || echo 0)
+    session_index_retry_busy session_index_load_synonyms "$synonyms_file"
+    _syn_count=$(session_index_sql "SELECT COUNT(*) FROM synonyms;" 2>/dev/null || echo 0)
 fi
 
 ui_phase_active_simple "Phase 6: FTS rebuild" "rebuilding index..." "$_p6_start"
 
-session_index_rebuild_fts
-sqlite3 "$SESSION_INDEX_DB" "INSERT INTO sessions_fts(sessions_fts) VALUES ('optimize');" 2>/dev/null
+session_index_retry_busy session_index_rebuild_fts
+session_index_sql "INSERT INTO sessions_fts(sessions_fts) VALUES ('optimize');" 2>/dev/null
 
-_fts_count=$(sqlite3 "$SESSION_INDEX_DB" "SELECT COUNT(*) FROM sessions_fts;" 2>/dev/null || echo 0)
+_fts_count=$(session_index_sql "SELECT COUNT(*) FROM sessions_fts;" 2>/dev/null || echo 0)
 ui_phase_done "Phase 6: FTS rebuild" "$_fts_count entries, $_syn_count synonyms" "$_p6_start"
 
 # ─── Phase 7: Generate search chunks ─────────────────────
 
+_bf_phase="Phase 7: Chunk generation"
 _p7_start=$(_ui_now)
 CHUNK_SCRIPT="$REPO_DIR/scripts/session-index-chunk.py"
 if [ -f "$CHUNK_SCRIPT" ]; then
     ui_phase_active_simple "Phase 7: Chunk generation" "generating chunks..." "$_p7_start"
+    # In the background with wait, so a TERM ends the run now instead of when the child returns.
     if [ -n "${SINCE_DAYS:-}" ]; then
-        python3 "$CHUNK_SCRIPT" --backfill --since "$SINCE_DAYS" 2>/dev/null
+        python3 "$CHUNK_SCRIPT" --backfill --since "$SINCE_DAYS" 2>/dev/null &
     else
-        python3 "$CHUNK_SCRIPT" --backfill 2>/dev/null
+        python3 "$CHUNK_SCRIPT" --backfill 2>/dev/null &
     fi
-    _chunk_count=$(sqlite3 "$SESSION_INDEX_DB" ".timeout 5000" "SELECT COUNT(*) FROM session_chunks;" 2>/dev/null || echo 0)
+    _BF_CHILD=$!
+    wait "$_BF_CHILD"
+    _BF_CHILD=""
+    _chunk_count=$(session_index_sql "SELECT COUNT(*) FROM session_chunks;" 2>/dev/null || echo 0)
     ui_phase_done "Phase 7: Chunk generation" "$_chunk_count chunks" "$_p7_start"
 else
     ui_phase_skip "Phase 7: Chunk generation" "chunk script not found"
@@ -840,8 +1019,9 @@ fi
 
 # ─── Summary ──────────────────────────────────────────────
 
-total=$(sqlite3 "$SESSION_INDEX_DB" "SELECT COUNT(*) FROM sessions;" 2>/dev/null)
-untagged=$(sqlite3 "$SESSION_INDEX_DB" "SELECT COUNT(*) FROM sessions WHERE tagged_at IS NULL;" 2>/dev/null)
+_bf_phase="Summary"
+total=$(session_index_sql "SELECT COUNT(*) FROM sessions;" 2>/dev/null)
+untagged=$(session_index_sql "SELECT COUNT(*) FROM sessions WHERE tagged_at IS NULL;" 2>/dev/null)
 db_size=$(ls -lh "$SESSION_INDEX_DB" | awk '{print $5}')
 _total_elapsed=$(_ui_elapsed "$_backfill_start")
 
@@ -854,6 +1034,11 @@ ui_summary "Backfill Complete" "${_total_elapsed}s" \
     "Database" "$db_size"
 
 # Update meta
-sqlite3 "$SESSION_INDEX_DB" "INSERT OR REPLACE INTO meta (key, value) VALUES ('last_backfill', '$(date -u +"%Y-%m-%dT%H:%M:%SZ")');"
+session_index_sql "INSERT OR REPLACE INTO meta (key, value) VALUES ('last_backfill', '$(date -u +"%Y-%m-%dT%H:%M:%SZ")');"
 
 session_index_log "Backfill complete: $total sessions"
+
+if [ "$_json_flag" = 1 ]; then
+    _bf_counts=$(_backfill_counts_json)
+    jq -cn --arg db "$SESSION_INDEX_DB" --argjson counts "$_bf_counts" '{ok: true, database: $db} + $counts' >&3
+fi

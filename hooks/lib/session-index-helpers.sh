@@ -50,6 +50,85 @@ session_index_sql() {
     fi
 }
 
+# ─── Retry on a Locked DB ─────────────────────────────────
+# session_index_retry_busy CMD [ARGS...]: runs CMD, again with backoff while it exits 5, which is
+# what the sqlite3 CLI exits with when the DB stays locked past the busy timeout. Returns CMD's last
+# status, so a spent budget still fails its caller. Runs CMD in a condition, where errexit is off,
+# so CMD has to return its own failure.
+#
+# The notice prints once, then clears itself. A caller silences it by setting it empty.
+SESSION_INDEX_RETRY_ATTEMPTS=4
+SESSION_INDEX_RETRY_NOTICE="Retrying automatically…"
+
+session_index_retry_busy() {
+    local attempt=1 delay=1 rc
+    while :; do
+        rc=0
+        "$@" || rc=$?
+        if [ "$rc" != 5 ] || [ "$attempt" -ge "$SESSION_INDEX_RETRY_ATTEMPTS" ]; then
+            return "$rc"
+        fi
+        if [ -n "$SESSION_INDEX_RETRY_NOTICE" ]; then
+            printf '%s\n' "$SESSION_INDEX_RETRY_NOTICE" >&2
+            SESSION_INDEX_RETRY_NOTICE=""
+        fi
+        sleep "$delay"
+        attempt=$((attempt + 1))
+        delay=$((delay * 2))
+    done
+}
+
+# ─── Portable date and stat ───────────────────────────────
+# Each dialect is picked once at load: `--version` exits 1 on BSD. Never chain
+# `stat -f ... || stat -c ...`, because GNU `stat -f` prints a filesystem dump before it fails.
+_SESSION_INDEX_DATE_DIALECT=bsd
+if date --version >/dev/null 2>&1; then
+    _SESSION_INDEX_DATE_DIALECT=gnu
+fi
+_SESSION_INDEX_STAT_DIALECT=bsd
+if stat --version >/dev/null 2>&1; then
+    _SESSION_INDEX_STAT_DIALECT=gnu
+fi
+
+# session_index_date_to_epoch YYYY-MM-DDTHH:MM:SS: the epoch of that UTC time. Fails if unreadable.
+session_index_date_to_epoch() {
+    if [ "$_SESSION_INDEX_DATE_DIALECT" = gnu ]; then
+        date -u -d "$1" +%s
+    else
+        TZ=UTC date -jf "%Y-%m-%dT%H:%M:%S" "$1" +%s
+    fi
+}
+
+# session_index_epoch_to_iso EPOCH: that time as UTC ISO 8601.
+session_index_epoch_to_iso() {
+    if [ "$_SESSION_INDEX_DATE_DIALECT" = gnu ]; then
+        date -u -d "@$1" +"%Y-%m-%dT%H:%M:%SZ"
+    else
+        date -r "$1" -u +"%Y-%m-%dT%H:%M:%SZ"
+    fi
+}
+
+# session_index_file_epoch FILE: the file's mtime as an epoch.
+session_index_file_epoch() {
+    if [ "$_SESSION_INDEX_STAT_DIALECT" = gnu ]; then
+        stat -c %Y "$1"
+    else
+        stat -f %m "$1"
+    fi
+}
+
+# session_index_file_mtime_iso FILE: the file's mtime on one line. Local time labelled Z on both
+# dialects: the mislabel is a known defect, kept so a re-run stores the same value.
+session_index_file_mtime_iso() {
+    if [ "$_SESSION_INDEX_STAT_DIALECT" = gnu ]; then
+        local epoch
+        epoch=$(stat -c %Y "$1") || return 1
+        date -d "@$epoch" +"%Y-%m-%dT%H:%M:%SZ"
+    else
+        stat -f "%Sm" -t "%Y-%m-%dT%H:%M:%SZ" "$1"
+    fi
+}
+
 # ─── Script-Level Lock ────────────────────────────────────
 # Prevents concurrent heavy writers (backfill, tagger) from conflicting.
 # Hooks use non-blocking mode and skip if locked.
@@ -677,10 +756,14 @@ session_index_stats() {
 # ─── Rebuild FTS (for bulk operations) ─────────────────────
 
 session_index_rebuild_fts() {
+    # One transaction: a failed INSERT closes the connection, which rolls back the DELETE, so the old
+    # index stays. IMMEDIATE takes the write lock up front, where the busy timeout applies.
     session_index_sql <<'SQL'
+BEGIN IMMEDIATE;
 DELETE FROM sessions_fts;
 INSERT INTO sessions_fts (session_id, summary, first_prompt, tags, keywords, project_name, context_text, assistant_text, files_changed, commands_run, search_aliases)
     SELECT session_id, summary, first_prompt, tags, keywords, project_name, context_text, assistant_text, files_changed, commands_run, search_aliases FROM sessions;
+COMMIT;
 SQL
 }
 
@@ -703,7 +786,8 @@ session_index_load_synonyms() {
 
     jq -r '.[] | .term as $term | .category as $cat | .expansions[] | [$term, ., $cat] | @tsv' "$synonyms_file" | \
     while IFS=$'\t' read -r term expansion category; do
-        session_index_sql "INSERT OR IGNORE INTO synonyms (term, expansion, category) VALUES ('$(echo "$term" | sed "s/'/''/g")', '$(echo "$expansion" | sed "s/'/''/g")', '$(echo "$category" | sed "s/'/''/g")');"
+        # The exit carries a failed row out of this pipeline's subshell even where errexit is off.
+        session_index_sql "INSERT OR IGNORE INTO synonyms (term, expansion, category) VALUES ('$(echo "$term" | sed "s/'/''/g")', '$(echo "$expansion" | sed "s/'/''/g")', '$(echo "$category" | sed "s/'/''/g")');" || exit $?
     done
 }
 

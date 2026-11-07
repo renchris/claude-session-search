@@ -85,12 +85,15 @@ session_index_lock() {
 session_index_trylock() {
     mkdir -p "$(dirname "$SESSION_INDEX_LOCKFILE")"
     exec 9>"$SESSION_INDEX_LOCKFILE"
-    if flock -n -x 9 2>/dev/null; then
-        _SESSION_INDEX_LOCK_FD=9
-        trap 'session_index_unlock' EXIT
-        return 0
+    if command -v flock >/dev/null 2>&1; then
+        # A failed flock -n is a held lock here. Taking the mkdir lock too would let two holders in.
+        if flock -n -x 9 2>/dev/null; then
+            _SESSION_INDEX_LOCK_FD=9
+            trap 'session_index_unlock' EXIT
+            return 0
+        fi
+        return 1
     fi
-    # flock unavailable or lock held
     if mkdir "$SESSION_INDEX_LOCKFILE.d" 2>/dev/null; then
         _SESSION_INDEX_LOCK_FD="mkdir"
         trap 'session_index_unlock' EXIT

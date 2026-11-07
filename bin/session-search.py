@@ -873,8 +873,37 @@ def load_synonyms(conn):
         for term, expansion in rows:
             syns.setdefault(term.lower(), []).append(expansion.lower())
         return syns
-    except Exception:
-        return {}
+    except sqlite3.OperationalError as e:
+        if "no such table: synonyms" in str(e):
+            return {}
+        raise
+
+
+def _warn_no_chunk_index() -> None:
+    headline = "Deep search unavailable: the chunk index isn't built."
+    build = "~/.claude/bin/session-index-chunk.py --backfill"
+    if MODE.json:
+        warn("not_found", f"{headline} Build it: {build}")
+        return
+    # A spinner frame may be on the line already; its next one lands below the warning.
+    if _spinner_allowed(MODE):
+        sys.stderr.write(_CLEAR_LINE)
+    warn("not_found", headline)
+    print(f"Build it:\n    {build}", file=sys.stderr)
+
+
+def _is_fts_query_error(exc: sqlite3.Error) -> bool:
+    """True when FTS5 rejected the query text, so the next strategy may still match.
+
+    Any other error means the index itself is unusable. FTS5 words its "unterminated string"
+    and "unknown special query" rejections without its fts5: prefix.
+    """
+    message = str(exc)
+    return message.startswith("fts5") or any(
+        text in message
+        for text in ("syntax error", "no such column", "unterminated string", "unknown special query")
+    )
+
 
 def expand_synonyms(tokens, synonym_map):
     """Expand tokens using synonym map. Returns expanded token list."""
@@ -1043,9 +1072,11 @@ class QueryPipeline:
         text, auto_date_range = extract_temporal(normalized)
 
         # CLI date flags override auto-extracted
-        if date_after:
-            start = datetime.fromisoformat(date_after).replace(tzinfo=timezone.utc)
+        if date_after or date_before:
+            start = datetime.min.replace(tzinfo=timezone.utc)
             end = datetime.now(timezone.utc)
+            if date_after:
+                start = datetime.fromisoformat(date_after).replace(tzinfo=timezone.utc)
             if date_before:
                 end = datetime.fromisoformat(date_before).replace(tzinfo=timezone.utc)
             auto_date_range = (start, end)
@@ -1292,8 +1323,10 @@ class QueryPipeline:
 
         try:
             rows = conn.execute(sql, params).fetchall()
-        except sqlite3.OperationalError:
-            return []
+        except sqlite3.OperationalError as e:
+            if _is_fts_query_error(e):
+                return []
+            raise
 
         results = []
         for row in rows:
@@ -1329,8 +1362,11 @@ class QueryPipeline:
         conn = self._connect()
         try:
             conn.execute("SELECT 1 FROM chunks_fts LIMIT 0")
-        except sqlite3.OperationalError:
-            return []  # chunks_fts doesn't exist yet
+        except sqlite3.OperationalError as e:
+            if "no such table" not in str(e):
+                raise
+            _warn_no_chunk_index()
+            return []
 
         sql = """
             SELECT c.chunk_id, c.session_id, c.start_turn, c.end_turn,
@@ -1362,8 +1398,10 @@ class QueryPipeline:
 
         try:
             rows = conn.execute(sql, params).fetchall()
-        except sqlite3.OperationalError:
-            return []
+        except sqlite3.OperationalError as e:
+            if _is_fts_query_error(e):
+                return []
+            raise
 
         # Deduplicate: keep best chunk per session_id
         seen = {}
@@ -1491,8 +1529,10 @@ class QueryPipeline:
                 (fts_query,)
             )
             return cursor.fetchone()[0]
-        except Exception:
-            return 0
+        except sqlite3.OperationalError as e:
+            if _is_fts_query_error(e):
+                return 0
+            raise
 
     def suggest_alternatives(self, raw_query, limit=4):
         """When search fails, suggest queries that would return results."""
@@ -1700,9 +1740,48 @@ class QueryPipeline:
         self._seen_descriptions.add(desc_hash)
         return desc
 
+    def analytics_data(self, fails_only: bool = False) -> dict[str, Any]:
+        """Search log statistics. fails_only leaves out top_queries and recent."""
+        conn = self._connect()
+        total = conn.execute("SELECT COUNT(*) FROM search_log").fetchone()[0]
+        avg_latency = conn.execute("SELECT AVG(pipeline_ms) FROM search_log").fetchone()[0]
+        zero_results = conn.execute(
+            "SELECT query, COUNT(*) as cnt FROM search_log WHERE result_count = 0 "
+            "GROUP BY query ORDER BY cnt DESC LIMIT 20"
+        ).fetchall()
+        zero_count = conn.execute(
+            "SELECT COUNT(*) FROM search_log WHERE result_count = 0"
+        ).fetchone()[0]
+        data: dict[str, Any] = {
+            "total": total,
+            "avg_latency_ms": avg_latency,
+            "zero_result_count": zero_count,
+            "zero_result_pct": (zero_count / total * 100) if total else 0,
+            "zero_result_queries": [{"query": r[0], "count": r[1]} for r in zero_results],
+        }
+        if fails_only:
+            return data
+
+        top_queries = conn.execute(
+            "SELECT query, COUNT(*) as cnt, AVG(result_count) as avg_results "
+            "FROM search_log GROUP BY query ORDER BY cnt DESC LIMIT 15"
+        ).fetchall()
+        recent = conn.execute(
+            "SELECT query, result_count, pipeline_ms, created_at "
+            "FROM search_log ORDER BY created_at DESC LIMIT 10"
+        ).fetchall()
+        data["top_queries"] = [
+            {"query": r[0], "count": r[1], "avg_results": r[2]} for r in top_queries
+        ]
+        data["recent"] = [
+            {"query": r[0], "result_count": r[1], "pipeline_ms": r[2], "created_at": r[3]}
+            for r in recent
+        ]
+        return data
+
     def _show_analytics(self, fails_only=False):
         """Show search log statistics with box-drawing layout."""
-        conn = self._connect()
+        data = self.analytics_data(fails_only)
         color = _use_color()
         R = "\033[0m" if color else ""
         BOLD = "\033[1m" if color else ""
@@ -1719,46 +1798,28 @@ class QueryPipeline:
         tw = _get_term_width()
         bw = min(56, tw - 4)  # box width
 
-        # Total searches
-        total = conn.execute("SELECT COUNT(*) FROM search_log").fetchone()[0]
+        total = data["total"]
 
         if total == 0:
             print(f"\n  {DIM}No search history yet.{R}\n")
             return
 
-        # Average latency
-        avg_latency = conn.execute("SELECT AVG(pipeline_ms) FROM search_log").fetchone()[0]
-
-        # Zero-result queries
-        zero_results = conn.execute(
-            "SELECT query, COUNT(*) as cnt FROM search_log WHERE result_count = 0 "
-            "GROUP BY query ORDER BY cnt DESC LIMIT 20"
-        ).fetchall()
-        zero_count = conn.execute(
-            "SELECT COUNT(*) FROM search_log WHERE result_count = 0"
-        ).fetchone()[0]
-        zero_pct = (zero_count / total * 100) if total else 0
+        avg_latency = data["avg_latency_ms"]
+        zero_results = data["zero_result_queries"]
+        zero_count = data["zero_result_count"]
+        zero_pct = data["zero_result_pct"]
 
         if fails_only:
             print()
             print(f"  {BOLD}{WHITE}Zero-Result Queries{R}  {DIM}({len(zero_results)} unique){R}")
             print(f"  {DIM}{H * bw}{R}")
             for row in zero_results:
-                print(f"   {YELLOW}{row[1]:>3}\u00d7{R}  {row[0]}")
+                print(f"   {YELLOW}{row['count']:>3}\u00d7{R}  {row['query']}")
             print()
             return
 
-        # Top queries
-        top_queries = conn.execute(
-            "SELECT query, COUNT(*) as cnt, AVG(result_count) as avg_results "
-            "FROM search_log GROUP BY query ORDER BY cnt DESC LIMIT 15"
-        ).fetchall()
-
-        # Recent searches
-        recent = conn.execute(
-            "SELECT query, result_count, pipeline_ms, created_at "
-            "FROM search_log ORDER BY created_at DESC LIMIT 10"
-        ).fetchall()
+        top_queries = data["top_queries"]
+        recent = data["recent"]
 
         # ─── Summary Box ─────────────────────────────────
         title = "Search Analytics"
@@ -1789,10 +1850,10 @@ class QueryPipeline:
         print(f"  {BOLD}{WHITE}Top Queries{R}")
         print(f"  {DIM}{H * bw}{R}")
         for row in top_queries:
-            count_str = f"{row[1]:>3}\u00d7"
-            avg_str = f"avg {row[2]:>2.0f} results"
+            count_str = f"{row['count']:>3}\u00d7"
+            avg_str = f"avg {row['avg_results']:>2.0f} results"
             query_w = bw - len(count_str) - len(avg_str) - 4
-            query_display = row[0][:query_w].ljust(query_w)
+            query_display = row["query"][:query_w].ljust(query_w)
             print(f"   {YELLOW}{count_str}{R}  {query_display}  {DIM}{avg_str}{R}")
 
         # ─── Failed Queries ──────────────────────────────
@@ -1801,25 +1862,25 @@ class QueryPipeline:
             print(f"  {BOLD}{WHITE}Failed Queries{R}  {DIM}(tuning targets){R}")
             print(f"  {DIM}{H * bw}{R}")
             for row in zero_results[:10]:
-                print(f"   {YELLOW}{row[1]:>3}\u00d7{R}  {row[0]}")
+                print(f"   {YELLOW}{row['count']:>3}\u00d7{R}  {row['query']}")
 
         # ─── Recent Searches ─────────────────────────────
         print()
         print(f"  {BOLD}{WHITE}Recent Searches{R}")
         print(f"  {DIM}{H * bw}{R}")
         for row in recent:
-            ts = row[3]
+            ts = row["created_at"]
             # Show just date portion for compactness
             try:
                 dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
                 ts_short = dt.strftime("%m/%d %H:%M")
             except Exception:
                 ts_short = ts[:16]
-            res_str = f"{row[1]:>2} res"
-            ms_str = f"{row[2]:>.0f}ms"
+            res_str = f"{row['result_count']:>2} res"
+            ms_str = f"{row['pipeline_ms']:>.0f}ms"
             meta = f"{res_str}  {ms_str}"
             query_w = bw - len(ts_short) - len(meta) - 4
-            query_display = row[0][:query_w].ljust(query_w)
+            query_display = row["query"][:query_w].ljust(query_w)
             print(f"   {DIM}{ts_short}{R}  {query_display}{DIM}{meta}{R}")
 
         print()
@@ -2435,6 +2496,8 @@ def workflow_result_path(session_id: str) -> Optional[str]:
 def _extract_last_messages(session_id, project_path, count=3):
     """Extract last N user messages from transcript JSONL file."""
     projects_dir = Path.home() / ".claude" / "projects"
+    if not projects_dir.is_dir():
+        return []
     # Encode project path: /Users/foo/bar → -Users-foo-bar
     if project_path and project_path != "unknown":
         encoded = project_path.replace("/", "-")
@@ -2460,7 +2523,7 @@ def _extract_last_messages(session_id, project_path, count=3):
 
     msgs = []
     try:
-        with open(paths_to_try[0]) as f:
+        with open(paths_to_try[0], encoding="utf-8", errors="replace") as f:
             for line in f:
                 try:
                     d = json.loads(line)
@@ -2482,7 +2545,7 @@ def _extract_last_messages(session_id, project_path, count=3):
                     msgs.append(text[:300])
                 except Exception:
                     pass
-    except Exception:
+    except OSError:
         pass
 
     return msgs[-count:] if msgs else []
@@ -2537,25 +2600,49 @@ def format_preview(session):
 
 def _cache_results(results):
     """Cache search results for --resume without repeating query."""
+    text = json.dumps(
+        [{"session_id": r["session_id"], "summary": r.get("summary", ""),
+          "first_prompt": r.get("first_prompt", ""), "message_count": r.get("message_count", 0)}
+         for r in results],
+        default=str
+    )
     try:
-        CACHE_PATH.write_text(json.dumps(
-            [{"session_id": r["session_id"], "summary": r.get("summary", ""),
-              "first_prompt": r.get("first_prompt", ""), "message_count": r.get("message_count", 0)}
-             for r in results],
-            default=str
-        ))
-    except Exception:
-        pass
+        atomic_write_text(CACHE_PATH, text)
+    except OSError as err:
+        warn(
+            "partial_failure",
+            f"Couldn't save results to ~/.claude/.last-search-results.json: {err}. "
+            "claude-search --resume N may use an older search.",
+        )
+        # A result number must not resolve against a list the user no longer sees. In a directory
+        # that refuses the write, this refuses too, which is the warning's "may".
+        try:
+            CACHE_PATH.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def _cache_read_error(detail: object) -> CliError:
+    return CliError(
+        f"Can't read the result cache at ~/.claude/.last-search-results.json: {detail}.",
+        recovery=(("Run the search again:", 'claude-search "<QUERY>"'),),
+    )
 
 
 def _load_cached_results():
-    """Load cached results from last search."""
+    """Load cached results from last search. No file means no earlier search, which is not an error."""
     try:
-        if CACHE_PATH.exists():
-            return json.loads(CACHE_PATH.read_text())
-    except Exception:
-        pass
-    return []
+        results = json.loads(CACHE_PATH.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return []
+    # ValueError: both JSONDecodeError and UnicodeDecodeError.
+    except (OSError, ValueError) as err:
+        raise _cache_read_error(err) from err
+    if not isinstance(results, list) or not all(
+        isinstance(r, dict) and isinstance(r.get("session_id"), str) for r in results
+    ):
+        raise _cache_read_error("it isn't a list of results")
+    return results
 
 
 # ─── CLI ──────────────────────────────────────────────────
@@ -2635,6 +2722,9 @@ def main():
             return
 
         if args.analytics:
+            if args.json:
+                emit_json({"analytics": pipeline.analytics_data(args.fails)})
+                return
             pipeline._show_analytics(fails_only=args.fails)
             return
 

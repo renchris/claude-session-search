@@ -15,6 +15,8 @@ Options:
                       or ISO 8601 (2026-03-01). With no offset, a date is UTC.
                       The last one given wins. An empty value is refused.
       --enrich-only   Skip discovery and only re-extract enrichment.
+      --if-idle       Exit 0 without running if another run holds the index
+                      lock, and log the skip. Default: wait for the lock.
       --quiet         Accepted, with no effect: the output stays the same.
   -h, --help          Show this help.
 
@@ -82,11 +84,13 @@ source "$SCRIPT_DIR/lib/cli-common.sh"
 
 _PROG=session-index-backfill.sh
 _enrich_flag=0
+_if_idle_flag=0
 _since_value=""
 # Parse-only stops below instead, so that a help example with a bad --since fails too.
 __SESSION_SEARCH_PARSE_ONLY='' css_parse_args "$_PROG" \
     "quiet||bool|_quiet_flag" \
     "enrich-only||bool|_enrich_flag" \
+    "if-idle||bool|_if_idle_flag" \
     "since|s|value|_since_value" \
     "help|h|bool|_help_flag" \
     -- "$@"
@@ -180,7 +184,14 @@ session_index_init_db
 
 # ─── Acquire exclusive lock (blocks if tagger/another backfill is running) ───
 
-session_index_lock
+if [ "$_if_idle_flag" = 1 ]; then
+    if ! session_index_trylock; then
+        session_index_log "Backfill skipped: index busy"
+        exit 0
+    fi
+else
+    session_index_lock
+fi
 
 # ─── Pre-count totals for progress tracking ────────────────
 

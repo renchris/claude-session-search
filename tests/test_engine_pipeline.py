@@ -319,7 +319,6 @@ class AnalyticsData(PipelineCase):
         self.seed()
         out = io.StringIO()
         with (
-            mock.patch.object(engine, "_use_color", return_value=False),
             contextlib.redirect_stdout(out),
         ):
             self.pipeline._show_analytics()

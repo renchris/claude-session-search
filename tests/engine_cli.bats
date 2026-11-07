@@ -296,6 +296,16 @@ seed_session_row() {
     [ -e "$CACHE" ]
 }
 
+@test "a picker search leaves the list --resume N reads alone" {
+    run --separate-stderr engine aurora
+    [ "$status" -eq 0 ]
+    before="$(cat "$CACHE")"
+    run --separate-stderr engine --format=fzf rum
+    [ "$status" -eq 0 ]
+    [ -n "$output" ]
+    [ "$(cat "$CACHE")" = "$before" ]
+}
+
 @test "--limit 500 is clamped with a warning" {
     run --separate-stderr engine --limit 500 migration
     [ "$status" -eq 0 ]

@@ -2917,7 +2917,10 @@ def main():
 
         if not args.no_log:
             pipeline.log_search(query, len(results), pipeline_ms=elapsed_ms)
-        _cache_results(results)
+        # The picker's rows carry their own IDs, and its per-keystroke prefixes would replace the list
+        # --resume N reads with results nobody saw numbered.
+        if args.format != "fzf":
+            _cache_results(results)
 
         # Reset dedup tracking before rendering
         pipeline.reset_dedup()

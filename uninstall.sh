@@ -6,7 +6,8 @@ set -euo pipefail
 usage() {
     cat <<'EOF'
 Remove claude-session-search from ~/.claude/: its links, its hook entries in settings.json and its
-LaunchAgents. session-index.db stays. Runs without prompting; ./install.sh puts everything back.
+LaunchAgents. session-index.db stays, and so do the PATH line, settings backups, logs, the result
+cache and the tips file; the run lists them. Runs without prompting; ./install.sh puts everything back.
 
 Usage: ./uninstall.sh [options]
 
@@ -202,6 +203,36 @@ plan_plist() {
     fi
 }
 
+# each_left_behind FN: FN PATH NOTE for each thing this script finds and keeps. A shell profile is the
+# user's to edit, and the rest is theirs to clear. It removes none of them.
+each_left_behind() {
+    local path
+    for path in "$HOME/.zshrc" "$HOME/.bashrc"; do
+        if grep -qF '.claude/bin' "$path" 2>/dev/null; then
+            "$1" "$path" "PATH line"
+        fi
+    done
+    for path in "$SETTINGS".bak*; do
+        if [ -e "$path" ]; then
+            "$1" "$path" "settings backup"
+        fi
+    done
+    if [ -d "$CLAUDE_DIR/logs" ]; then
+        "$1" "$CLAUDE_DIR/logs" "logs"
+    fi
+    if [ -e "$CLAUDE_DIR/.last-search-results.json" ]; then
+        "$1" "$CLAUDE_DIR/.last-search-results.json" "result cache"
+    fi
+    if [ -e "$CLAUDE_DIR/.session-search-tips.json" ]; then
+        "$1" "$CLAUDE_DIR/.session-search-tips.json" "tips file"
+    fi
+}
+
+# shellcheck disable=SC2329 # each_left_behind calls it
+plan_left_behind() {
+    plan_row keep "$1" "$2" skipped
+}
+
 print_plan() {
     local path
     echo "Plan:"
@@ -228,6 +259,7 @@ print_plan() {
     else
         plan_row absent "$DB" "" not_found
     fi
+    each_left_behind plan_left_behind
 }
 
 if [ "$OPT_DRY_RUN" = 1 ]; then
@@ -361,6 +393,19 @@ if [ -e "$DB" ]; then
 else
     record "$DB" not_found
 fi
+
+left_behind_header=0
+# shellcheck disable=SC2329 # each_left_behind calls it
+show_left_behind() {
+    if [ "$left_behind_header" = 0 ]; then
+        left_behind_header=1
+        echo ""
+        echo "Left in place:"
+    fi
+    echo "  - $1 ($2)"
+    record "$1" skipped
+}
+each_left_behind show_left_behind
 
 echo ""
 echo "────────────────────────────────────────────"

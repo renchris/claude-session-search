@@ -198,7 +198,57 @@ backup_count() {
     run env HOME="$empty" "$REPO/uninstall.sh"
     [ "$status" -eq 0 ]
     has "$output" "Uninstall complete."
+    lacks "$output" "Left in place:"
     [ -z "$(ls -A "$empty")" ]
+}
+
+# What a used install leaves, with a .bashrc that has no PATH line and so must not be listed.
+# shellcheck disable=SC2016 # the lines as a profile holds them
+seed_left_behind() {
+    printf '# claude-session-search\nexport PATH="$HOME/.claude/bin:$PATH"\n' >"$HOME/.zshrc"
+    printf 'export PATH="/opt/bin:$PATH"\n' >"$HOME/.bashrc"
+    printf '{}' >"$SETTINGS.bak.Ab12Cd"
+    mkdir -p "$HOME/.claude/logs"
+    printf 'line\n' >"$HOME/.claude/logs/session-index.log"
+    printf '[]' >"$HOME/.claude/.last-search-results.json"
+    printf '{}' >"$HOME/.claude/.session-search-tips.json"
+    LEFT_BEHIND=(
+        "$HOME/.zshrc"
+        "$SETTINGS.bak.Ab12Cd"
+        "$HOME/.claude/logs"
+        "$HOME/.claude/.last-search-results.json"
+        "$HOME/.claude/.session-search-tips.json"
+    )
+}
+
+@test "what stays is listed before the summary, and none of it changes" {
+    seed_left_behind
+    before="$(cd "$HOME" && cksum .zshrc .bashrc .claude/settings.json.bak.Ab12Cd .claude/logs/session-index.log \
+        .claude/.last-search-results.json .claude/.session-search-tips.json)"
+    run --separate-stderr "$REPO/uninstall.sh"
+    [ "$status" -eq 0 ]
+    for path in "${LEFT_BEHIND[@]}"; do
+        has "$output" "  - $path ("
+    done
+    has "$output" "$HOME/.zshrc (PATH line)"
+    lacks "$output" "  - $HOME/.bashrc"
+    has "${output%%Uninstall complete.*}" "Left in place:"
+    [ "$(cd "$HOME" && cksum .zshrc .bashrc .claude/settings.json.bak.Ab12Cd .claude/logs/session-index.log \
+        .claude/.last-search-results.json .claude/.session-search-tips.json)" = "$before" ]
+}
+
+@test "--json marks what stays as skipped, on a real run and a dry run" {
+    seed_left_behind
+    for args in --json '--json --dry-run'; do
+        # shellcheck disable=SC2086 # two words on purpose
+        run --separate-stderr "$REPO/uninstall.sh" $args
+        [ "$status" -eq 0 ]
+        assert_one_json_doc
+        for path in "${LEFT_BEHIND[@]}"; do
+            printf '%s' "$output" | jq -e --arg id "$path" 'any(.results[]; .id == $id and .outcome == "skipped")'
+        done
+        printf '%s' "$output" | jq -e --arg id "$HOME/.bashrc" 'all(.results[]; .id != $id)'
+    done
 }
 
 @test "uninstall removes every link install created" {
@@ -492,8 +542,10 @@ expected_rows() {
     run --separate-stderr "$REPO/uninstall.sh" --json
     [ "$status" -eq 0 ]
     assert_one_json_doc
-    [ "$(json_rows)" = "$(expected_rows removed)" ]
-    printf '%s' "$output" | jq -e '.summary == {succeeded: 13, failed: 0, skipped: 1, unknown: 0}'
+    # The run's own settings backup stays too, under a random name.
+    [ "$(json_rows | grep -Fv "$SETTINGS.bak.")" = "$(expected_rows removed)" ]
+    [ "$(json_rows | grep -Fc "$SETTINGS.bak.")" -eq 1 ]
+    printf '%s' "$output" | jq -e '.summary == {succeeded: 13, failed: 0, skipped: 2, unknown: 0}'
     has "$stderr" "Uninstall complete."
     [ ! -L "$BIN/claude-search" ]
 }

@@ -1,0 +1,18 @@
+--- stdout ---
+
+  ╭────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+  │ Session Search  2 results · <t> │
+  ╰────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
+   1  日本語のセッション zephyr 名前が長い値でも折り返されることを確認する: café déjà vu 🚀
+       5mo ·   24 msgs · feature/ünï-cödé-zephyr                                                              3f2b8c1e
+      ┊ zephyr の表示を 40 桁で確認する 🚀
+      ┊ 日本語のセッション zephyr 名前が長い値でも折り返されることを確認する: café déjà vu 🚀
+  ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+   2  A long zephyr summary that goes on well past any width a terminal column could give it, so it has to wrap or
+      shorten and never run into the next column of the row
+       5mo ·   24 msgs · feature/a-branch-name-that-is-much-longer-than-any-column-could-hold-zephyr, +5      a1b2c3d4
+      ┊ Please fix the zephyr parser bug that fails on long inputs, and keep every session ID intact
+      ┊ A long zephyr summary that goes on well past any width a terminal column could give it, so it has to wrap
+--- stderr ---
+Tip: Resume a result by number:
+    claude-search --resume 1

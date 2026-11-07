@@ -1,0 +1,18 @@
+--- stdout ---
+
+  ╭────────────────────────────────────╮
+  │ Session Search  2 results · <t> │
+  ╰────────────────────────────────────╯
+   1  日本語のセッション zephyr
+      名前が長い値でも折り返されることを確認する: café
+      déjà vu 🚀
+       5mo ·   24 msgs · +1   3f2b8c1e
+  ────────────────────────────────────
+   2  A long zephyr summary that goes
+      on well past any width a
+      terminal column could give it,
+      so it has to wrap or shorten
+      and never run into the next…
+       5mo ·   24 msgs · +6   a1b2c3d4
+--- stderr ---
+

@@ -8,8 +8,8 @@
 load helpers_scripts
 
 # Files still carrying a lint hit, as path:count. U21 empties both lists.
-PENDING_TTY_LINT_FILES="scripts/lib/progress-ui.sh:1"
-PENDING_ESCAPE_LINT_FILES="install.sh:1"
+PENDING_TTY_LINT_FILES=""
+PENDING_ESCAPE_LINT_FILES=""
 
 setup() {
     script_sandbox_setup

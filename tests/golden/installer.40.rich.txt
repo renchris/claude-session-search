@@ -1,0 +1,29 @@
+--- stdout ---
+
+  ╭──────────────────────────────────────────────────╮
+  │  claude-session-search installer                 │
+  ╰──────────────────────────────────────────────────╯
+
+  * Symlinks          linking hooks + bi  ✓ Symlinks          hooks + bin linked
+  * Settings          patching settings.  ✓ Settings          hooks registered in settings.json       —
+  * Indexing          scanning sessions.  ✓ Indexing          10 sessions, 9 tagged
+  * PATH              checking shell con  ✓ PATH              added to .zshrc
+  * Scheduler         registering schedu  ✓ Scheduler         backfill + sweep (60s) registered
+
+  ╭──────────────────────────────────────────────────╮
+  │  Installed  <t>│
+  ├──────────────────────────────────────────────────┤
+  │  Sessions       10                               │
+  │  Tagged         9                                │
+  ╰──────────────────────────────────────────────────╯
+
+jq reformatted settings.json when it added the hooks. The previous copy: <HOME>/.claude/settings.json.bak.<X>
+
+
+Add claude-search to this shell:
+    export PATH="$HOME/.claude/bin:$PATH"
+
+Search your sessions:
+    claude-search <QUERY>
+--- stderr ---
+

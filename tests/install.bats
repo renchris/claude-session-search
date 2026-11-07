@@ -333,7 +333,7 @@ JSON
     # A held lock is the one patch failure that reaches the library without a read-only tree.
     mkdir "$SETTINGS.lock.d"
     cp "$SETTINGS" "$HOME/settings.before"
-    run --separate-stderr "$INSTALL"
+    run --separate-stderr env __SESSION_SEARCH_LOCK_TRIES=3 "$INSTALL"
     [ "$status" -eq 1 ]
     has "$stderr" "Can't patch settings.json:"
     has "$stderr" "another install holds the lock"

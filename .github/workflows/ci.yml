@@ -8,12 +8,32 @@ on:
 
 jobs:
   smoke-test:
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # macOS runs the BSD date and stat branches, and the workflow index test below.
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    # A CLI that started asking for input would hang its test: tests/contract_modes.bats runs them
+    # with a terminal on stdin and nothing to read.
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v5
 
       - name: Install CLI deps
-        run: sudo apt-get update && sudo apt-get install -y sqlite3 jq bats
+        run: |
+          if [ "${{ runner.os }}" = "macOS" ]; then
+            brew install bats-core jq
+            # macOS ships sqlite3, but do not assume its build has FTS5.
+            if ! sqlite3 :memory: 'CREATE VIRTUAL TABLE t USING fts5(x);'; then
+              brew install sqlite
+              echo "$(brew --prefix sqlite)/bin" >>"$GITHUB_PATH"
+            fi
+            # The floor the engine needs, and FTS5 in the sqlite module of this python3.
+            python3 -c 'import sqlite3, sys; assert sys.version_info >= (3, 10), sys.version; sqlite3.connect(":memory:").execute("CREATE VIRTUAL TABLE t USING fts5(x)")'
+          else
+            sudo apt-get update && sudo apt-get install -y sqlite3 jq bats
+          fi
 
       - name: Bootstrap a synthetic index (no private data)
         run: |

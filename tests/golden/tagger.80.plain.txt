@@ -1,0 +1,12 @@
+--- stdout ---
+
+  ╭──────────────────────────────────────────────────╮
+  │  Session Tagger                    3 of 10 queued  │
+  ╰──────────────────────────────────────────────────╯
+
+  Mode: Regex-only  (no API key set)
+
+Tagged 3 of 3 sessions in <t>: tagged=3 failed=0 regex=3 haiku=0 summaries=+0
+--- stderr ---
+Processed 3 of 10 untagged sessions. 7 still untagged (0 failed, 7 not attempted).
+    python3 <REPO>/scripts/session-index-tag.py --regex-only --limit 7

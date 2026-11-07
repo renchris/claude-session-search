@@ -1,0 +1,13 @@
+--- stdout ---
+プロジェクト-zephyr  5mo · 24 msgs · 3f2b8c1e
+feature/ünï-cödé-zephyr
+
+About:
+  日本語のセッション zephyr 名前が長い値でも折り返されることを確認する: café déjà vu 🚀
+
+Recent Messages:
+  1. zephyr の表示を 40 桁で確認する 🚀
+  2. 日本語のセッション zephyr 名前が長い値でも折り返されることを確認する: café déjà vu 🚀 日本語のセッション zephyr 名前が長い値でも折り返されることを確認する: café déjà vu 🚀
+  3. zephyr 短いメッセージ
+--- stderr ---
+

@@ -347,7 +347,7 @@ OUT="$(
         --preview-window=right:55%:wrap \
         --header="Enter: resume | Ctrl-Y: copy ID | Ctrl-O: open project" \
         --bind="ctrl-o:execute(p=\$(python3 $SP_Q --json --preview {-1} 2>/dev/null | jq -r '.session.project_path // empty'); [ -n \"\$p\" ] && open \"\$p\")" \
-        --bind="change:reload:python3 $SP_Q --format=fzf --no-log ${ARGS_Q}-- {q} 2>/dev/null || true" \
+        --bind="change:reload:python3 $SP_Q --format=fzf --no-log --no-llm ${ARGS_Q}-- {q} 2>/dev/null || true" \
         --query="$QUERY" \
         --color="pointer:#22c55e,prompt:#7c3aed,hl:#d4af37,hl+:#d4af37" \
         --prompt="Search sessions > " \

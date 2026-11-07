@@ -220,7 +220,7 @@ flowchart TD
 
 The pipeline tries the **most precise** strategy first and only widens when a strategy returns fewer than 3 hits — so exact phrase matches win, but a fuzzy or partial query still finds something. Two safety nets sit underneath:
 
-- **LLM fallback** — if fewer than 3 results come back, Haiku rewrites the query into 4 interpretations, each searched and merged via Reciprocal Rank Fusion *(needs `ANTHROPIC_API_KEY`)*.
+- **LLM fallback** — if fewer than 3 results come back, Haiku rewrites the query into 4 interpretations, each searched and merged via Reciprocal Rank Fusion *(needs `ANTHROPIC_API_KEY`)*. In the `--fzf` picker only the initial query can use it; the as-you-type refresh never does, so keystrokes don't reach the API.
 - **Deep search** (`--deep-search`) — also queries a turn-level chunk index (5-turn sliding windows), so a phrase buried mid-conversation is findable even when the summary never mentions it.
 
 </details>

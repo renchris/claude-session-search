@@ -536,9 +536,22 @@ engine.validate_args(parser, parser.parse_args(sys.argv[1:]))
     typed=$'it\'s; touch Y'
     FZF_RUN_RELOAD="$typed" FZF_RC=1 run run_in_pty claude-search --fzf --project p q
     [ "$status" -eq 0 ]
-    expected=$'--format=fzf\n--project\np\n--\nq\n--format=fzf\n--no-log\n--project\np\n--\n'"$typed"
+    expected=$'--format=fzf\n--project\np\n--\nq\n--format=fzf\n--no-log\n--no-llm\n--project\np\n--\n'"$typed"
     [ "$(calls engine)" = "$expected" ]
     [ ! -e "$HOME/Y" ]
+}
+
+@test "fzf: expansion stays on for the first search and off for the as-you-type reload" {
+    use_stub_engine
+    cd "$HOME"
+    FZF_RUN_RELOAD=typed FZF_RC=1 run run_in_pty claude-search --fzf q
+    [ "$status" -eq 0 ]
+    # The engine's argv, one per line: everything up to the first query, then the reload's.
+    first="$(calls engine | sed '/^q$/q')"
+    reload="$(calls engine | sed '1,/^q$/d')"
+    [ "$(printf '%s\n' "$reload" | tail -n 1)" = typed ]
+    run ! grep -Fx -- --no-llm <<<"$first"
+    grep -Fx -- --no-llm <<<"$reload"
 }
 
 @test "fzf: Esc exits 130 and says Canceled" {

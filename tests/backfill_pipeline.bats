@@ -90,6 +90,11 @@ fake_chunk() {
     printf '%s\n' "$1" >"$COPY/scripts/session-index-chunk.py"
 }
 
+# fail_phase_6: the copy's FTS rebuild exits 7, a set -e failure at a known line of the backfill.
+fail_phase_6() {
+    printf 'session_index_rebuild_fts() { return 7; }\n' >>"$COPY/hooks/lib/session-index-helpers.sh"
+}
+
 # Every statement waits, so a fixture write can't lose to a slow close of the last process.
 db() {
     sqlite3 "$DB" ".timeout 60000" "$1"
@@ -362,8 +367,8 @@ time.sleep(600)'
 }
 
 @test "a set -e failure keeps its status" {
-    fake_chunk 'import sys
-sys.exit(7)'
+    fake_chunk 'pass'
+    fail_phase_6
     run --separate-stderr "$BACKFILL"
     [ "$status" -eq 7 ]
     index_lock_is_free
@@ -371,20 +376,32 @@ sys.exit(7)'
     [ -z "$(db "SELECT value FROM meta WHERE key='last_backfill';")" ]
 }
 
-@test "a failing Phase 7 names the line and keeps the exit code" {
-    fake_chunk 'import sys
-sys.exit(7)'
+@test "a failing step names the line and keeps the exit code" {
+    fake_chunk 'pass'
+    fail_phase_6
     run --separate-stderr "$BACKFILL" --quiet
     [ "$status" -eq 7 ]
-    # The wait, except on bash 3.2, whose LINENO in a trap is the end of the enclosing `if`.
-    local first last line
-    first="$(grep -n '^    wait "\$_BF_CHILD"$' "$BACKFILL" | cut -d: -f1)"
-    last="$(awk -v from="$first" 'NR > from && /^fi$/ { print NR; exit }' "$BACKFILL")"
-    line="${stderr#error: backfill failed at line }"
-    line="${line% (exit 7)}"
+    local line
+    line="$(grep -n '^session_index_retry_busy session_index_rebuild_fts$' "$BACKFILL" | cut -d: -f1)"
+    [ -n "$line" ]
     [ "$stderr" = "error: backfill failed at line $line (exit 7)" ]
-    [ "$line" -ge "$first" ]
-    [ "$line" -le "$last" ]
+}
+
+@test "a failed chunk step is reported and logged, and the run still finishes and records itself" {
+    fake_chunk 'import sys
+print("chunk boom", file=sys.stderr)
+sys.exit(7)'
+    seed_index
+    run --separate-stderr "$BACKFILL" --json
+    [ "$status" -eq 0 ]
+    assert_one_json_doc "$output"
+    printf '%s' "$output" | jq -e '.ok == true and .phases.phase7.exit_code == 7 and .phases.phase1.indexed == 2'
+    has "$stderr" "chunk step failed (exit 7), see $HOME/.claude/logs/session-index.log"
+    has "$stderr" "Backfill Complete"
+    has "$(cat "$HOME/.claude/logs/session-index.log")" "chunk boom"
+    has "$(cat "$HOME/.claude/logs/session-index.log")" "chunk step failed (exit 7)"
+    [ -n "$(db "SELECT value FROM meta WHERE key='last_backfill';")" ]
+    index_lock_is_free
 }
 
 # ─── date and stat on this host ──────────────────────────
@@ -581,13 +598,13 @@ GOLDEN
 }
 
 @test "--json on failure has an error document and the original rc" {
-    fake_chunk 'import sys
-sys.exit(7)'
+    fake_chunk 'pass'
+    fail_phase_6
     seed_index
     run --separate-stderr "$BACKFILL" --json
     [ "$status" -eq 7 ]
     assert_one_json_doc "$output"
-    printf '%s' "$output" | jq -e '.ok == false and .exit_code == 7 and .phase == "Phase 7: Chunk generation"
+    printf '%s' "$output" | jq -e '.ok == false and .exit_code == 7 and .phase == "Phase 6: FTS rebuild"
         and .phases.phase1.indexed == 2 and (.message | contains("re-run"))'
 }
 

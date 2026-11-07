@@ -147,7 +147,7 @@ _backfill_counts_json() {
         --argjson p4bi "${phase4b_indexed:-0}" --argjson p4bb "${phase4b_bad:-0}" \
         --argjson p5e "${phase5_enriched:-0}" --argjson p5s "${phase5_skipped:-0}" --argjson p5n "${phase5_nofound:-0}" \
         --argjson fts "${_fts_count:-0}" --argjson syn "${_syn_count:-0}" \
-        --argjson chunks "${_chunk_count:-0}" \
+        --argjson chunks "${_chunk_count:-0}" --argjson chunk_rc "${_chunk_rc:-0}" \
         --argjson total "${total:-0}" --argjson untagged "${untagged:-0}" \
         '{phases: {
             phase1: {indexed: $p1},
@@ -157,7 +157,7 @@ _backfill_counts_json() {
             phase4b: {indexed: $p4bi, unreadable: $p4bb},
             phase5: {enriched: $p5e, empty: $p5s, no_transcript: $p5n},
             phase6: {fts_entries: $fts, synonyms: $syn},
-            phase7: {chunks: $chunks}
+            phase7: {chunks: $chunks, exit_code: $chunk_rc}
         }, total: $total, untagged: $untagged}'
 }
 
@@ -1002,17 +1002,27 @@ _p7_start=$(_ui_now)
 CHUNK_SCRIPT="$REPO_DIR/scripts/session-index-chunk.py"
 if [ -f "$CHUNK_SCRIPT" ]; then
     ui_phase_active_simple "Phase 7: Chunk generation" "generating chunks..." "$_p7_start"
+    mkdir -p "$(dirname "$SESSION_INDEX_LOG")"
     # In the background with wait, so a TERM ends the run now instead of when the child returns.
     if [ -n "${SINCE_DAYS:-}" ]; then
-        python3 "$CHUNK_SCRIPT" --backfill --since "$SINCE_DAYS" 2>/dev/null &
+        python3 "$CHUNK_SCRIPT" --backfill --since "$SINCE_DAYS" 2>>"$SESSION_INDEX_LOG" &
     else
-        python3 "$CHUNK_SCRIPT" --backfill 2>/dev/null &
+        python3 "$CHUNK_SCRIPT" --backfill 2>>"$SESSION_INDEX_LOG" &
     fi
     _BF_CHILD=$!
-    wait "$_BF_CHILD"
+    # Chunks are an extra index: a failed item must not cost the run its last_backfill. Exit 0 stays,
+    # because install.sh runs this bare under set -e. A signal never gets here: its trap exits first.
+    _chunk_rc=0
+    wait "$_BF_CHILD" || _chunk_rc=$?
     _BF_CHILD=""
     _chunk_count=$(session_index_sql "SELECT COUNT(*) FROM session_chunks;" 2>/dev/null || echo 0)
-    ui_phase_done "Phase 7: Chunk generation" "$_chunk_count chunks" "$_p7_start"
+    if [ "$_chunk_rc" -eq 0 ]; then
+        ui_phase_done "Phase 7: Chunk generation" "$_chunk_count chunks" "$_p7_start"
+    else
+        session_index_log "Backfill: chunk step failed (exit $_chunk_rc), continuing"
+        ui_phase_done "Phase 7: Chunk generation" \
+            "$_chunk_count chunks, chunk step failed (exit $_chunk_rc), see $SESSION_INDEX_LOG" "$_p7_start"
+    fi
 else
     ui_phase_skip "Phase 7: Chunk generation" "chunk script not found"
 fi

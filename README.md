@@ -27,14 +27,11 @@ $ claude-search "rum latency"
    3  Fly.io RUM latency testing, cold start bias, CLI fixes,
       cross-provider region discovery
        5mo ·   20 msgs · bugfix, deployment, monitoring, +2     08ada21a
-  ╭──────────────────────────────────────────────────────────────────────╮
-  │ ●  claude-search --resume N  ·  --fzf for interactive                │
-  ╰──────────────────────────────────────────────────────────────────────╯
 ```
 
 > Notice `rum` matched sessions about *monitoring* and *CloudWatch* — the query expanded through a synonym table before it ever hit the index. [See how](#see-exactly-why-every-result-ranked-where-it-did)
 
-**Everything stays on your machine.** Your sessions and the search index never leave it — the only network call is the optional Haiku tagging and query-expansion, and only when you set your own `ANTHROPIC_API_KEY`.
+**Everything stays on your machine.** Your sessions and the search index never leave it — the only network call is the optional Haiku tagging and query-expansion, and only when you set your own `ANTHROPIC_API_KEY`. With a key set, a search with few local matches sends the query to api.anthropic.com, including while you type in the `--fzf` picker; `--no-llm` or `SESSION_SEARCH_NO_LLM=1` stops that. The tagger sends session summaries and the start of the first prompt, and says so on stderr; `--regex-only` keeps it local.
 
 ---
 
@@ -82,15 +79,17 @@ cd claude-session-search
 
 1. **Symlinks** hooks and `bin/` into `~/.claude/` (edits in the repo go live immediately)
 2. **Registers** `SessionEnd` + `SessionStart` hooks in `settings.json` (backs it up first)
-3. **Backfills** every existing session via a 3-phase scan
+3. **Backfills** every existing session via a 7-phase scan
 4. **Tags** sessions with regex and builds the FTS5 index
 5. **Adds** `~/.claude/bin` to your `PATH`
-6. **Schedules** two background jobs (macOS `launchd`): a weekly backfill and a 60-second sweep
+6. **Schedules** two background jobs (macOS `launchd`): a weekly backfill and a 60-second sweep. On other systems the installer skips this step and says so
 7. **Pre-compiles** the Python engine for faster cold starts
+
+`./install.sh --help` lists its options and exit codes and changes nothing.
 
 </details>
 
-**Requires** `sqlite3` (with FTS5 — the macOS default), `python3` ≥ 3.8, and `jq`.
+**Requires** `sqlite3` (with FTS5 — the macOS default), `python3` ≥ 3.10, and `jq`.
 **Optional** (each unlocks a feature, none are required):
 
 | Package | Unlocks |
@@ -100,7 +99,7 @@ cd claude-session-search
 | `anthropic` | Haiku tagging + LLM query expansion |
 | `yake` | Multi-word key-phrase extraction |
 
-**Update:** `git pull && ./install.sh`  ·  **Uninstall:** `./uninstall.sh` (preserves your database)
+**Update:** `git pull && ./install.sh`  ·  **Uninstall:** `./uninstall.sh` (preserves your database). `./uninstall.sh --dry-run` shows the plan first, and `./uninstall.sh --help` lists its options.
 
 ---
 
@@ -111,10 +110,10 @@ claude-search "bottle menu"                 # Keyword search
 claude-search "monitoring last week"        # Temporal: "yesterday", "march 1", "last 3 days"
 claude-search "@reso sync"                  # Inline project filter
 claude-search "#auth #bugfix login"         # Inline tag filters (combinable)
-claude-search --after 2026-03-01 "rum"      # Explicit date range
-claude-search --project reso "sync"         # Flag-style project filter
+claude-search --since 2026-03-01 "rum"      # Explicit date range; --until sets the end
+claude-search --project reso "sync"         # Option-style project filter
 claude-search --deep-search "cold start"    # Also search inside conversation turns
-claude-search --json "floor plan"           # JSON output for scripting
+claude-search --json "floor plan"           # One JSON document for scripting
 ```
 
 **Natural-language dates work out of the box.** `yesterday`, `today`, `this week`, `last week`, `last 3 days`, `last 2 months`, `march 1`, and ISO dates (`2026-03-01`) are extracted from the query and turned into a date filter automatically.
@@ -238,7 +237,7 @@ flowchart LR
         H1["SessionEnd hook<br/>~200ms"]
         H2["SessionStart hook"]
         H3["Sweep daemon<br/>every 60s"]
-        BF["Backfill<br/>3-phase scan"]
+        BF["Backfill<br/>7-phase scan"]
     end
     DB[("SQLite FTS5<br/>session-index.db")]
     Q["claude-search 'query'"]
@@ -274,11 +273,14 @@ Tags like `database`, `monitoring`, `bottle-service`, `slide-out` are indexed an
 
 ```bash
 # Free, instant — 42 regex patterns (24 technology · 10 task-type · 8 domain)
-./scripts/session-index-tag.sh --regex-only
+session-index-tag.py --regex-only
 
 # Higher accuracy via Claude Haiku — ~95% accurate, ~$0.09 for 650 sessions
-ANTHROPIC_API_KEY=sk-... ./scripts/session-index-tag.sh
+export ANTHROPIC_API_KEY="$(<your secret manager's read command>)"
+session-index-tag.py --limit 650
 ```
+
+Each run tags up to `--limit` untagged sessions (default 100), and prints the exact command for the rest when more remain.
 
 ---
 
@@ -341,20 +343,122 @@ Then reload the table with `./scripts/session-index-backfill.sh`.
 
 <br>
 
-| Flag | Effect |
+| Option | Effect |
 |---|---|
 | `--fzf` | Interactive picker with live re-search |
-| `--resume N` | Resume result #N (with a query, or from the last search) |
-| `--explain` | Show match attribution, strategy, BM25, and expansions |
-| `--deep-search` | Also search within conversation turns |
-| `--after` / `--before YYYY-MM-DD` | Explicit date range |
-| `--project NAME` | Filter by project |
-| `--min-msgs N` | Minimum message count |
-| `--limit N` | Max results (default 10) |
-| `--json` | JSON output for scripting |
+| `--resume <SESSION>` | Resume a session by full ID, or by result number (with a query, or from the last search) |
+| `--explain`, `--no-explain` | Show match attribution, strategy, BM25, and expansions |
+| `--deep-search`, `--no-deep-search` | Also search within conversation turns |
+| `-s`, `--since <TIME>` | Only sessions after this time: ISO 8601 or relative (`7d`, `12h`). A date with no offset is UTC |
+| `-u`, `--until <TIME>` | Only sessions before this time; works on its own |
+| `-p`, `--project <NAME>` | Filter by project |
+| `--min-msgs <NUMBER>` | Minimum message count (default 0) |
+| `-n`, `--limit <NUMBER>` | Max results (default 10, max 200) |
+| `--json` | One JSON document (below) |
 | `--stats` | Index statistics |
-| `--analytics` / `--analytics --fails` | Search-log analytics |
-| `--preview ID` | Preview a single session |
+| `--analytics`, `--analytics --fails` | Search-log analytics; `--fails` shows only zero-result queries |
+| `--preview <SESSION>` | Preview a single session |
+| `--no-llm` | Never send the query to the Anthropic API |
+| `--no-color` | Turn off color |
+| `--non-interactive` | Never prompt |
+| `-d`, `--debug` | Print debug details on stderr |
+| `-v`, `--version` | Print the version |
+| `-h`, `--help` | Show help |
+
+`--after` and `--before` still work and warn; use `--since` and `--until`.
+
+**`--json` prints one document.** A search gives `{"sessions": [...], "pagination": {"next": null}}`, where each session has `rank`, `session_id`, `project_name`, `project_path`, `git_branch`, `created_at`, `modified_at`, `message_count`, `summary`, `tags`, `score` and `workflow_path`. `--preview` gives `{"session": {...}}`, `--stats` gives `{"stats": {...}}` and `--analytics` gives `{"analytics": {...}}`. A failure prints nothing on stdout and one JSON line on stderr.
+
+`--format json` is deprecated: it keeps its older bare array and prints a warning on stderr. It has no removal date. Piped search output without `--json` is the same table without color, so scripts should use `--json`.
+
+</details>
+
+<details>
+<summary><b>Exit codes</b></summary>
+
+<br>
+
+| Command | Code | Meaning |
+|---|---|---|
+| `claude-search` | 0 | Success or an empty result |
+| | 1 | Failure, including a missing engine, `fzf` or `claude` |
+| | 2 | Usage error or missing input |
+| | 130 | Canceled |
+| `./install.sh` | 0 | Success |
+| | 1 | A required step failed |
+| | 2 | Usage error |
+| `./uninstall.sh` | 0 | Success |
+| | 1 | `settings.json` could not be edited, or another step failed |
+| | 2 | Usage error |
+| `session-index-backfill.sh` | 0 | Success, or skipped by `--if-idle` |
+| | 1 | Failure, including a missing prerequisite or file |
+| | 2 | Usage error |
+| | 5 | The database stayed locked; a re-run is safe |
+| | 129, 130, 143 | Stopped by HUP, INT or TERM |
+| | Other | A failed step's own exit code |
+| `session-index-chunk.py` | 0 | Success, including skipped sessions |
+| | 1 | Failure, a missing database, or a bare invocation |
+| | 2 | Usage error |
+| | 130 | Interrupted |
+| `session-index-tag.py` | 0 | Success |
+| | 1 | Failure, including a held lock or a missing key under `--retag-summaries`; under `--json`, also when any session failed or was not attempted |
+| | 2 | Usage error |
+| | 130 | Interrupted after the work window |
+
+</details>
+
+<details>
+<summary><b>Environment variables</b></summary>
+
+<br>
+
+An empty value is the same as unset unless the row says otherwise. Each is read on every run and nothing is saved.
+
+| Variable | Effect | Precedence |
+|---|---|---|
+| `SESSION_SEARCH_NO_LLM` | Any non-empty value does what `--no-llm` does | Either one turns the API off |
+| `SESSION_SEARCH_DEBUG` | Any non-empty value does what `--debug` does | Either one turns debug on |
+| `SESSION_SEARCH_GUIDANCE_DISABLED` | Any non-empty value hides next-step tips | Tips also need an interactive terminal |
+| `SESSION_SEARCH_ACCESSIBLE` | `1` prints plain glyphs and refuses `--fzf`; any other value is off | Applies whatever the terminal supports |
+| `NO_COLOR` | Any non-empty value turns off color | Below `--no-color`, above `FORCE_COLOR` |
+| `FORCE_COLOR` | Keeps color tint on `Warning:` and `Error:` lines in plain output; `0` is off | Below `NO_COLOR` |
+| `ANTHROPIC_API_KEY` | Turns on Haiku tagging and query expansion. Read from the environment only and never stored | `--regex-only` and `--no-llm` win |
+| `SESSION_INDEX_BUSY_TIMEOUT` | How long backfill waits on a locked database, in milliseconds | Default is 60000 |
+
+</details>
+
+<details>
+<summary><b>Glossary</b></summary>
+
+<br>
+
+| Term | Meaning |
+|---|---|
+| Session | One Claude Code run, identified by its full session ID. Help writes it as `<SESSION>`; output labels it `Session ID` |
+| Result | One ranked row of a search |
+| Index | The database at `~/.claude/session-index.db` |
+| Transcript | The JSONL file Claude Code writes for a session |
+| Chunk | A window of turns from a transcript, searched by `--deep-search` |
+| Tag | A topic label on a session, such as `database` or `monitoring` |
+| Workflow result | A `wf_*` row for a workflow's result file. It can be previewed but not resumed |
+
+</details>
+
+<details>
+<summary><b>Behavior changes</b> — for scripts written against older versions</summary>
+
+<br>
+
+- Usage errors now exit 2 and print only to stderr.
+- A preview of an unknown ID exits 1.
+- `--deep`-style abbreviations are rejected. Spell options in full.
+- `claude-search help` shows help. `claude-search -- help` searches for the word.
+- Canceling the picker exits 130.
+- `--fzf` refuses non-interactive runs, including under `CI` or `CLAUDECODE`.
+- Zero-result text and tips now go to stderr, so piped stdout holds only results.
+- A bad `--since` value exits 2 before anything runs, on both `claude-search` and `session-index-backfill.sh`.
+- `./install.sh --help` and `./uninstall.sh --help` print help. They used to run the install or the uninstall, whatever the arguments.
+- `--format json` warns on stderr; its stdout is unchanged.
 
 </details>
 
@@ -376,7 +480,7 @@ claude-session-search/                      ~/.claude/
 │   ├── claude-search               ──────→ bin/claude-search             (the CLI)
 │   └── session-search.py           ──────→ bin/session-search.py         (the engine)
 ├── scripts/
-│   ├── session-index-backfill.sh           (3-phase history scan)
+│   ├── session-index-backfill.sh           (7-phase history scan)
 │   ├── session-index-tag.py                (regex + Haiku tagging)
 │   └── session-index-chunk.py              (turn-based chunks for --deep-search)
 ├── synonyms/default.json                   (66 terms · 289 expansions)

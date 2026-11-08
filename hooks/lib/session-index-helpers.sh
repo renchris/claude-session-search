@@ -36,25 +36,36 @@ session_index_log() {
 #   session_index_sql <<'SQL'
 #   INSERT INTO sessions (...) VALUES (...);
 #   SQL
+#
+# A DB still locked after the timeout returns 5 on every sqlite3 build. 3.43 exits 5 itself;
+# 3.53 and 3.54 (Homebrew, the macOS CI runner; measured) exit 1 and print "database is locked",
+# so that text is mapped to 5, which session_index_retry_busy and backfill's exit code rely on.
 
 SESSION_INDEX_BUSY_TIMEOUT="${SESSION_INDEX_BUSY_TIMEOUT:-5000}"
 
 session_index_sql() {
+    local sql rc=0 err
     if [ $# -gt 0 ]; then
-        sqlite3 "$SESSION_INDEX_DB" ".timeout $SESSION_INDEX_BUSY_TIMEOUT" "$1"
+        sql="$1"
     else
         # Read SQL from stdin (heredoc)
-        local sql
         sql=$(cat)
-        sqlite3 "$SESSION_INDEX_DB" ".timeout $SESSION_INDEX_BUSY_TIMEOUT" "$sql"
     fi
+    # stdout passes straight through fd 3; only stderr is captured, then re-printed.
+    { err="$(sqlite3 "$SESSION_INDEX_DB" ".timeout $SESSION_INDEX_BUSY_TIMEOUT" "$sql" 2>&1 1>&3 3>&-)" || rc=$?; } 3>&1
+    [ -z "$err" ] || printf '%s\n' "$err" >&2
+    case "$rc:$err" in
+        0:* | 5:*) ;;
+        *"database is locked"*) rc=5 ;;
+    esac
+    return "$rc"
 }
 
 # ─── Retry on a Locked DB ─────────────────────────────────
 # session_index_retry_busy CMD [ARGS...]: runs CMD, again with backoff while it exits 5, which is
-# what the sqlite3 CLI exits with when the DB stays locked past the busy timeout. Returns CMD's last
+# what session_index_sql exits with when the DB stays locked past the busy timeout. Returns CMD's last
 # status, so a spent budget still fails its caller. Runs CMD in a condition, where errexit is off,
-# so CMD has to return its own failure.
+# so CMD has to return its own failure. CMD runs in this shell, so state it sets survives.
 #
 # The notice prints once, then clears itself. A caller silences it by setting it empty.
 SESSION_INDEX_RETRY_ATTEMPTS=4
